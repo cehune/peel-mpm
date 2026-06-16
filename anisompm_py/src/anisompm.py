@@ -31,21 +31,57 @@ from __future__ import annotations
 import math
 import torch
 
-# Keep the fast cuSOLVER backend (its batched `eigh` is broken on Blackwell
-# sm_120, and MAGMA's eigh/svd is far slower), and derive the symmetric
-# eigendecomposition we need from the SVD instead.
 def sym_eig(A: torch.Tensor):
-    """Eigendecomposition of a batch of symmetric 3x3 matrices, derived from the
-    SVD (which is fast and reliable on this GPU).  For a symmetric A = Q L Q^T,
-    SVD gives A = U S V^T with S=|L|, U=Q, and sign(L_i)=sign(u_i . v_i).
-    Returns (evals ascending, evecs as columns)."""
-    U, S, Vh = torch.linalg.svd(A)
-    V = Vh.transpose(1, 2)
-    sign = torch.sign((U * V).sum(1))
-    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-    evals = S * sign
-    evals, order = torch.sort(evals, dim=1)
-    Q = torch.gather(U, 2, order.unsqueeze(1).expand(-1, 3, -1))
+    """Analytic eigendecomposition of a batch of symmetric 3x3 matrices.
+
+    Closed form (Cardano for the eigenvalues, null-space products + a cross
+    product for the eigenvectors).  No LAPACK / cuSOLVER / SVD, so it runs
+    natively on every backend including Apple MPS (where torch.linalg.svd is
+    unimplemented and silently falls back to CPU -- a host<->device copy every
+    substep).  It is also correct on indefinite/degenerate stress, unlike the
+    old SVD sign-recovery trick which mis-signed balanced shear (eigs +/-s with
+    equal singular values).  Returns (evals ascending, evecs as columns)."""
+    a00 = A[:, 0, 0]; a11 = A[:, 1, 1]; a22 = A[:, 2, 2]
+    a01 = A[:, 0, 1]; a02 = A[:, 0, 2]; a12 = A[:, 1, 2]
+    q = (a00 + a11 + a22) / 3.0
+    p1 = a01 * a01 + a02 * a02 + a12 * a12
+    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
+    p = torch.sqrt(torch.clamp(p2 / 6.0, min=1e-30))
+    iso = (p2 < 1e-18)                                       # A ~ q I (degenerate)
+    bp = 1.0 / p
+    b00 = (a00 - q) * bp; b11 = (a11 - q) * bp; b22 = (a22 - q) * bp
+    b01 = a01 * bp; b02 = a02 * bp; b12 = a12 * bp
+    detB = (b00 * (b11 * b22 - b12 * b12)
+            - b01 * (b01 * b22 - b12 * b02)
+            + b02 * (b01 * b12 - b11 * b02))
+    r = torch.clamp(0.5 * detB, -1.0, 1.0)
+    phi = torch.acos(r) / 3.0
+    TWO_PI_3 = 2.0943951023931953                            # 2*pi/3
+    e1 = q + 2.0 * p * torch.cos(phi)                        # largest
+    e3 = q + 2.0 * p * torch.cos(phi + TWO_PI_3)             # smallest
+    e2 = 3.0 * q - e1 - e3
+    I3 = torch.eye(3, device=A.device, dtype=A.dtype).expand_as(A)
+
+    def _vec(li, lj):                                        # eigvec of the third eval
+        M = (A - li.view(-1, 1, 1) * I3) @ (A - lj.view(-1, 1, 1) * I3)
+        nrm = M.norm(dim=1)                                  # per-column norms (N,3)
+        k = nrm.argmax(dim=1)                                # most reliable column
+        v = torch.gather(M, 2, k.view(-1, 1, 1).expand(-1, 3, 1))[:, :, 0]
+        return v / (v.norm(dim=1, keepdim=True) + 1e-30)
+
+    v1 = _vec(e2, e3)                                        # eigvec for e1
+    v3 = _vec(e1, e2)                                        # eigvec for e3
+    v2 = torch.cross(v3, v1, dim=1)
+    v2 = v2 / (v2.norm(dim=1, keepdim=True) + 1e-30)
+    v3 = torch.cross(v1, v2, dim=1)                          # re-orthonormalise
+    if iso.any():                                            # fall back to I basis
+        im = iso.view(-1, 1)
+        ex = torch.tensor([1.0, 0, 0], device=A.device, dtype=A.dtype)
+        ey = torch.tensor([0, 1.0, 0], device=A.device, dtype=A.dtype)
+        ez = torch.tensor([0, 0, 1.0], device=A.device, dtype=A.dtype)
+        v1 = torch.where(im, ex, v1); v2 = torch.where(im, ey, v2); v3 = torch.where(im, ez, v3)
+    evals = torch.stack([e3, e2, e1], dim=1)                 # ascending
+    Q = torch.stack([v3, v2, v1], dim=2)                     # columns match evals
     return evals, Q
 
 
@@ -134,15 +170,18 @@ class AnisoMPM:
             new["a0"] = f
             new["alpha"] = torch.full((N,), float(alpha), device=dev, dtype=dt)
 
-        # Optional per-particle "isolate normal" override for the damage driver.
-        # Where iso_normal is True we replace the transverse-isotropic structural
-        # tensor A = I + alpha (a (x) a) with the rank-1 projector A = n (x) n,
-        # n = R n0, so the ONLY stress component that drives damage is the normal
-        # traction sigma_nn = n . sigma . n.  Used for hand-tuned interface bands
-        # (delamination) where a single fiber with alpha=-1 can only *protect* one
-        # direction, not *isolate* one.  Defaults: off, n0 = 0.
-        new["n0"] = torch.zeros(N, 3, device=dev, dtype=dt)
-        new["iso_normal"] = torch.zeros(N, device=dev, dtype=torch.bool)
+        # Reference structural tensor A0 (the single source of truth for the
+        # damage filter).  The driver uses the *current* tensor A = R A0 R^T,
+        # which co-rotates A0 by the polar rotation R.  Fibers are just one way
+        # to build A0:  A0 = I + alpha (a0 (x) a0).  set_structural_tensor() can
+        # overwrite A0 per particle with any symmetric 3x3 -- e.g. the rank-1
+        # projector A0 = n (x) n, which makes phi = (sigma_nn^+/sigma_c)^2 so the
+        # ONLY damage driver is the normal traction (delamination bands), with no
+        # single-fiber "protect one direction" limitation.
+        a0_ = new["a0"]; al_ = new["alpha"]
+        aa0 = a0_.unsqueeze(2) * a0_.unsqueeze(1)                       # (N,3,3)
+        eyeN = torch.eye(3, device=dev, dtype=dt).expand(N, 3, 3)
+        new["A0"] = eyeN + al_.view(-1, 1, 1) * aa0                     # I + alpha a0 a0^T
 
         # critical stress.  The AnisoMPM C++ derives sigma_c from a "percentage"
         # of the energy/stress at failure of the elastic model.  We use the
@@ -166,7 +205,7 @@ class AnisoMPM:
             self.mu = new["mu"]; self.lam = new["lam"]
             self.d = new["d"]; self.lap = new["lap"]
             self.a0 = new["a0"]; self.alpha = new["alpha"]
-            self.n0 = new["n0"]; self.iso_normal = new["iso_normal"]
+            self.A0 = new["A0"]
             self.sigma_c = new["sigma_c"]; self.eta = new["eta"]
             # per-object scalars promoted to per-particle where they may differ
             N = new["x"].shape[0]
@@ -182,7 +221,7 @@ class AnisoMPM:
             self.mu = cat(self.mu, new["mu"]); self.lam = cat(self.lam, new["lam"])
             self.d = cat(self.d, new["d"]); self.lap = cat(self.lap, new["lap"])
             self.a0 = cat(self.a0, new["a0"]); self.alpha = cat(self.alpha, new["alpha"])
-            self.n0 = cat(self.n0, new["n0"]); self.iso_normal = cat(self.iso_normal, new["iso_normal"])
+            self.A0 = cat(self.A0, new["A0"])
             self.sigma_c = cat(self.sigma_c, new["sigma_c"]); self.eta = cat(self.eta, new["eta"])
             N = new["x"].shape[0]
             self.zeta = cat(self.zeta, torch.full((N,), new["zeta"], device=self.device, dtype=self.dtype))
@@ -205,33 +244,52 @@ class AnisoMPM:
         r = torch.where(nrm > 1e-9, r / (nrm + 1e-12), torch.zeros_like(r))
         self.a0 = r
         self.alpha = torch.full((self.n,), float(alpha), device=self.device, dtype=self.dtype)
+        # keep A0 in sync: A0 = I + alpha a0 a0^T  (so A = R A0 R^T reproduces the
+        # old A = I + alpha (R a0)(R a0)^T exactly).
+        aa = self.a0.unsqueeze(2) * self.a0.unsqueeze(1)
+        eyeN = torch.eye(3, device=self.device, dtype=self.dtype).expand(self.n, 3, 3)
+        self.A0 = eyeN + self.alpha.view(-1, 1, 1) * aa
+        return self
+
+    def set_structural_tensor(self, mask, A0):
+        """Overwrite the reference structural tensor A0 for the masked particles.
+
+        A0 is the per-particle damage filter in the *reference* frame; the driver
+        uses the co-rotated A = R A0 R^T each step.  Pass any symmetric 3x3 per
+        particle.  Common recipes:
+            A0 = I - r r^T   (radial fiber, alpha=-1): protect the radial axis.
+            A0 = r r^T       (rank-1 projector): isolate the normal traction, so
+                              phi = (sigma_nn^+ / sigma_c)^2 -- the delamination
+                              filter, with the whole tangent plane protected.
+
+        mask : (N,) bool                which particles to overwrite
+        A0   : (N,3,3) or (M,3,3)       new reference tensors; only mask rows used
+        """
+        mask = torch.as_tensor(mask, device=self.device).bool()
+        A = torch.as_tensor(A0, device=self.device, dtype=self.dtype)
+        if A.dim() == 2:                                   # one tensor for all masked
+            A = A.unsqueeze(0).expand(int(mask.sum()), 3, 3)
+        if A.shape[0] == int(mask.sum()):                  # only the masked rows given
+            full = self.A0.clone()
+            full[mask] = A
+            A = full
+        self.A0 = torch.where(mask.view(-1, 1, 1), A, self.A0)
         return self
 
     def set_normal_isolation(self, mask, normals):
-        """Flag particles whose damage driver should isolate the normal traction.
+        """Convenience wrapper: isolate the normal traction via A0 = n (x) n.
 
-        For the flagged particles the structural tensor becomes the rank-1
-        projector  A = n (x) n  (n = R n0), so phi = (sigma_nn / sigma_c)^2 and
-        ONLY the normal-normal stress can grow damage.  This is the correct way
-        to express the interface "delamination band": a single transverse-
-        isotropic fiber with alpha=-1 protects one direction (A = I - a a^T),
-        whereas isolation needs A = n n^T, which is not reachable as I + alpha a a^T
-        for any alpha.  `normals` are stored as reference n0 and co-rotate with R,
-        exactly like the fibers a0.
-
-        mask    : (N,) bool        which particles to isolate
-        normals : (N,3) or (M,3)   reference normals; only mask==True rows used
-        """
+        Equivalent to set_structural_tensor(mask, n n^T) with n normalised.
+        `normals` may be (N,3) or (M,3) for the M masked rows."""
         mask = torch.as_tensor(mask, device=self.device).bool()
         nrm = torch.as_tensor(normals, device=self.device, dtype=self.dtype)
-        if nrm.shape[0] == int(mask.sum()):                # only the masked rows given
+        if nrm.shape[0] == int(mask.sum()):
             full = torch.zeros(self.n, 3, device=self.device, dtype=self.dtype)
             full[mask] = nrm
             nrm = full
         nrm = nrm / (nrm.norm(dim=1, keepdim=True) + 1e-12)
-        self.n0 = torch.where(mask.unsqueeze(1), nrm, self.n0)
-        self.iso_normal = self.iso_normal | mask
-        return self
+        nn = nrm.unsqueeze(2) * nrm.unsqueeze(1)
+        return self.set_structural_tensor(mask, nn[mask])
 
     # ---------------------------------------------------------------- kernels
     def _weights(self, x):
@@ -267,15 +325,28 @@ class AnisoMPM:
         for bc in self.particle_bc:
             bc(self, time)
 
-        # ---- constitutive: SVD, stress, damage driving ----------------------
+        # ---- constitutive: polar decomposition, stress, damage driving ------
+        # Analytic polar via the symmetric eig of C = F^T F (no SVD -> MPS-safe).
+        # F = R U with U = V diag(S) V^T.  We must get R *exactly orthogonal* for
+        # ANY stretch (the SVD's U@Vh was orthogonal for free).  Key fact: the
+        # columns of (F V) are F v_i, which are mutually orthogonal with norms S_i
+        # (since (F v_i).(F v_j) = v_i^T C v_j = S_i^2 delta_ij).  So normalising
+        # each column of F V by its OWN norm yields an orthonormal frame, and
+        # R = normalize_cols(F V) @ V^T is orthogonal regardless of S magnitude.
+        # (Dividing by a *clamped* S instead leaves R non-orthogonal when the
+        #  element stretches past the clamp -> stress blow-up.  Do not do that.)
         F = self.F
-        U, S, Vh = torch.linalg.svd(F)
+        C = F.transpose(1, 2) @ F                             # right Cauchy-Green (SPD)
+        lamC, V = sym_eig(C)                                  # ascending eigenvalues
+        S = torch.sqrt(torch.clamp(lamC, min=1e-12))          # singular values = |F v_i|
+        Vt = V.transpose(1, 2)
+        W = F @ V                                             # columns F v_i (orthogonal)
+        What = W / (W.norm(dim=1, keepdim=True) + 1e-12)      # orthonormalise columns
+        R = What @ Vt                                         # exactly orthogonal polar rotation
         if self.f_clamp is not None:                          # strain-limit (stability)
-            Sc = S.clamp(self.f_clamp[0], self.f_clamp[1])
-            F = (U * Sc.unsqueeze(1)) @ Vh
+            S = S.clamp(self.f_clamp[0], self.f_clamp[1])
+            F = R @ (V @ torch.diag_embed(S) @ Vt)            # clamp stretch only (R untouched)
             self.F = F
-            S = Sc
-        R = U @ Vh                                            # rotation (polar)
         J = (S[:, 0] * S[:, 1] * S[:, 2]).clamp(min=1e-6)
         mu = self.mu.view(-1, 1, 1)
         lam = self.lam.view(-1, 1, 1)
@@ -296,22 +367,15 @@ class AnisoMPM:
             evals_p = evals.clamp(min=0.0)                    # tensile part
             sigma_p = evecs @ torch.diag_embed(evals_p) @ evecs.transpose(1, 2)
 
-            # structural tensor A = I + alpha (a (x) a), a = R a0
-            a = (R @ self.a0.unsqueeze(-1)).squeeze(-1)       # (N,3)
-            aa = a.unsqueeze(2) * a.unsqueeze(1)              # (N,3,3)
-            A = I3 + self.alpha.view(-1, 1, 1) * aa
-
-            # interface override: A = n (x) n, n = R n0  -> isolates sigma_nn.
-            # (rank-1 projector; not expressible as I + alpha a a^T, so it must be
-            #  built here at the construction site, not stored once -- A is rebuilt
-            #  every damage step from the current rotation R.)
-            if self.iso_normal.any():
-                nvec = (R @ self.n0.unsqueeze(-1)).squeeze(-1)    # (N,3), unit (R orthogonal)
-                nn = nvec.unsqueeze(2) * nvec.unsqueeze(1)        # (N,3,3)
-                A = torch.where(self.iso_normal.view(-1, 1, 1), nn, A)
+            # current structural tensor: co-rotate the reference A0 by the polar
+            # rotation R.  A0 = I + alpha a0 a0^T reproduces the fiber recipe, while
+            # set_structural_tensor() can have replaced A0 with any tensor (e.g. the
+            # rank-1 projector r r^T that isolates the normal traction).
+            A = R @ self.A0 @ R.transpose(1, 2)               # (N,3,3)
 
             M = A @ sigma_p
             phi = (M @ M).diagonal(dim1=1, dim2=2).sum(1) / (self.sigma_c ** 2)
+            self.phi = phi                                    # expose for diagnostics
             dTilde = self.zeta * torch.relu(phi - 1.0)
             resist = self.d - (self.l0 ** 2) * self.lap
             ddot = torch.relu((1.0 - self.d) * dTilde - resist)
@@ -471,3 +535,57 @@ def halfspace_collider(origin_fn, normal, mode="slip", friction=0.0):
         vv[inside] = _resolve(v[inside], vcol, n.unsqueeze(0), mode, friction)
         return vv
     return col
+
+
+# --------------------------------------------------------------------- LA self-test
+def _la_selftest(device="cpu", n=20000, seed=0):
+    """Validate the analytic linear algebra against torch's LAPACK reference.
+
+    Run me on your machine to confirm the MPS / CPU path is correct:
+        python3 src/anisompm.py            # cpu
+        python3 src/anisompm.py mps        # Apple GPU
+    Reference (eigh/svd) is always computed on CPU in float64; the analytic
+    sym_eig runs on the requested device/dtype."""
+    torch.manual_seed(seed)
+    dev = torch.device(device)
+    # symmetric eig: reconstruction + comparison to eigh
+    B = torch.randn(n, 3, 3, dtype=torch.float64)
+    Asym = 0.5 * (B + B.transpose(1, 2))
+    # include nasty cases: pure shear (degenerate singular values) + isotropic
+    Asym[0] = torch.tensor([[0., 2, 0], [2, 0, 0], [0, 0, 0]], dtype=torch.float64)
+    Asym[1] = 3.0 * torch.eye(3, dtype=torch.float64)
+    ev, Q = sym_eig(Asym.to(dev, torch.float32))
+    ev, Q = ev.cpu().double(), Q.cpu().double()           # .cpu() first: MPS has no float64
+    recon = (Q @ torch.diag_embed(ev) @ Q.transpose(1, 2) - Asym).abs().amax()
+    ortho = (Q.transpose(1, 2) @ Q - torch.eye(3).double()).abs().amax()
+    ev_ref = torch.linalg.eigvalsh(Asym)
+    ev_err = (ev.sort(1).values - ev_ref).abs().amax()
+    # polar decomposition: same column-normalised formula as substep.  Tested on
+    # a hard mix incl. near-singular random F -- R must be orthogonal regardless
+    # of stretch (this is the property the clamped-1/S version lost).
+    torch.manual_seed(seed + 1)
+    Q1 = torch.linalg.qr(torch.randn(n, 3, 3, dtype=torch.float64)).Q
+    sv = 0.2 + 7.8 * torch.rand(n, 3, dtype=torch.float64)    # wide stretch range [0.2, 8]
+    F = Q1 @ torch.diag_embed(sv) @ torch.linalg.qr(torch.randn(n, 3, 3, dtype=torch.float64)).Q.transpose(1, 2)
+    F = F[torch.linalg.det(F) > 0]
+    C = (F.transpose(1, 2) @ F).to(dev, torch.float32)
+    lam, Vv = sym_eig(C); lam, Vv = lam.cpu().double(), Vv.cpu().double()
+    Vt = Vv.transpose(1, 2)
+    W = F @ Vv
+    Rp = (W / (W.norm(dim=1, keepdim=True) + 1e-12)) @ Vt      # column-normalised polar R
+    r_ortho = (Rp.transpose(1, 2) @ Rp - torch.eye(3).double()).abs().amax()
+    r_svd = (Rp - (lambda u, s, vh: u @ vh)(*torch.linalg.svd(F))).abs().amax()
+    print(f"[LA self-test on {device}, float32 analytic vs float64 LAPACK]")
+    print(f"  sym_eig  reconstruction  max|Δ| = {float(recon):.2e}")
+    print(f"  sym_eig  orthonormality  max|Δ| = {float(ortho):.2e}")
+    print(f"  sym_eig  eigenvalue vs eigh     = {float(ev_err):.2e}")
+    print(f"  polar R  orthogonality   max|Δ| = {float(r_ortho):.2e}")
+    print(f"  polar R  vs SVD U@Vh     max|Δ| = {float(r_svd):.2e}")
+    ok = max(float(recon), float(ortho), float(ev_err), float(r_ortho), float(r_svd)) < 1e-3
+    print("  RESULT:", "PASS" if ok else "CHECK (float32 tolerance ~1e-3)")
+    return ok
+
+
+if __name__ == "__main__":
+    import sys
+    _la_selftest(device=sys.argv[1] if len(sys.argv) > 1 else "cpu")

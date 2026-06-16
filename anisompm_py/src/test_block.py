@@ -20,7 +20,22 @@ from anisompm import AnisoMPM, halfspace_collider
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "out", "validation")
 os.makedirs(OUT, exist_ok=True)
-dev = "cuda:0"
+
+
+def _pick_device():
+    """env DEV overrides; else cuda -> Apple mps -> cpu."""
+    d = os.environ.get("DEV")
+    if d:
+        return d
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+dev = _pick_device()
+print(f"[test_block] device={dev}")
 
 
 def grid_block(lo, hi, n_per_dim):

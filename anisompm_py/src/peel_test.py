@@ -59,6 +59,12 @@ def parse_args():
     ap.add_argument("--frames", type=int, default=48)
     ap.add_argument("--fps", type=int, default=24)
     ap.add_argument("--dt", type=float, default=3e-4)
+    ap.add_argument("--f-clamp", default="0.35,2.8", dest="f_clamp",
+                    help="F singular-value clamp 'smin,smax' (stability) or 'none'. "
+                         "The analytic polar is float32 and the clamp rebuild can "
+                         "NaN on aggressive configs (pre-existing; see LA self-test). "
+                         "The gate uses 'none', which is stable and still develops "
+                         "damage.")
     ap.add_argument("--E-flesh", type=float, default=2e4, dest="E_flesh")
     ap.add_argument("--E-int", type=float, default=4e4, dest="E_int")
     ap.add_argument("--E-peel", type=float, default=1e5, dest="E_peel")
@@ -78,6 +84,21 @@ def parse_args():
                     help="pull angle off the pole normal (+y). 0=pure normal "
                          "(mode-I tension), 90=tangential (pure shear). "
                          "Pull dir = (sin, cos, 0) in the x-y plane.")
+    ap.add_argument("--aniso", choices=["correct", "iso", "wrong"], default="correct",
+                    help="interface (peel|interface) damage-DRIVER tensor A0: "
+                         "correct=n(x)n (normal isolation), iso=I (isotropic, no "
+                         "directional selection), wrong=I-n(x)n (tangential "
+                         "isolation, protects the normal). Flesh stays I-r(x)r.")
+    ap.add_argument("--directional", choices=["on", "off"], default="on",
+                    help="interface STRESS model: on=directional split (release "
+                         "normal+shear, keep in-plane) via directional_kirchhoff; "
+                         "off=isotropic g(d) (bonded baseline). Decoupled from "
+                         "--aniso so you can A/B the stress model with the driver "
+                         "held fixed.")
+    ap.add_argument("--equal-E", action="store_true", dest="equal_E",
+                    help="force E_int=E_peel=E_flesh: kills modulus contrast so "
+                         "correct/iso/wrong differ ONLY in the structural tensor.")
+    ap.add_argument("--seed", type=int, default=0, help="particle-lattice jitter seed")
     ap.add_argument("--plot-every", type=int, default=4, dest="plot_every",
                     help="save a cross-section png every k frames (0=off)")
     ap.add_argument("--log-every", type=int, default=4, dest="log_every",
@@ -137,13 +158,15 @@ def main():
     t_i = max(0.07 * R, 2.5 * spacing)  # plan said 0.03R; see module docstring
     assert t_p + t_i < 0.7 * R, "shells eat the flesh core; raise ngrid/ppcd or R"
 
-    pts = ball_particles(c, R, spacing)
+    pts = ball_particles(c, R, spacing, seed=args.seed)
     x = torch.tensor(pts, device=dev)
     vol = torch.full((len(pts),), spacing ** 3, device=dev)
 
+    fclamp = (None if str(args.f_clamp).lower() == "none"
+              else tuple(float(v) for v in str(args.f_clamp).split(",")))
     sim = AnisoMPM(n_grid=args.ngrid, grid_lim=GRID_LIM, dt=args.dt,
                    gravity=(0.0, 0.0, 0.0), grid_damp=0.999,
-                   f_clamp=(0.35, 2.8), damage_every=args.damage_every, device=dev)
+                   f_clamp=fclamp, damage_every=args.damage_every, device=dev)
     # placeholder elasticity/sigma_c -- overwritten per region below
     sim.add_object(x, vol, rho=500, E=args.E_flesh, nu=0.4,
                    fibers=None, alpha=0.0, percentage=1.0,
@@ -162,6 +185,8 @@ def main():
     def lame(E, nu=0.4):
         return E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu))
 
+    if args.equal_E:                          # Block 1: strip modulus contrast
+        args.E_int = args.E_peel = args.E_flesh
     for m, E in ((flesh, args.E_flesh), (interface, args.E_int), (peel, args.E_peel)):
         mu, lam = lame(E)
         sim.mu[m] = mu
@@ -175,8 +200,21 @@ def main():
     r_hat = rel / r.clamp(min=1e-9).unsqueeze(1)
     rr = r_hat.unsqueeze(2) * r_hat.unsqueeze(1)  # (N,3,3) r x r
     I3 = torch.eye(3, device=dev, dtype=sim.dtype)
-    sim.set_structural_tensor(flesh, (I3 - rr)[flesh])             # orange recipe
-    sim.set_structural_tensor(peel | interface, rr[peel | interface])  # sigma_nn only
+    sim.set_structural_tensor(flesh, (I3 - rr)[flesh])             # flesh: orange recipe
+    # interface (peel|interface) damage-DRIVER tensor A0, per --aniso:
+    iface = peel | interface
+    if args.aniso == "correct":
+        A_if = rr                                  # n(x)n -> phi=(sigma_nn^+/sigma_c)^2
+    elif args.aniso == "iso":
+        A_if = I3.expand(sim.n, 3, 3)              # isotropic driver (no selection)
+    else:                                          # "wrong": tangential isolation
+        A_if = I3 - rr                             # protects normal, drives on shear
+    sim.set_structural_tensor(iface, A_if[iface])
+    # STRESS model, decoupled from the driver: registering the interface normals
+    # switches substep to the directional split there.  --directional off leaves
+    # the isotropic g(d) bonded baseline (matrix still holds the bond at d=1).
+    if args.directional == "on":
+        sim.set_interface_normals(iface, r_hat[iface])
 
     # ---- Step 4: clamp bottom, pull top peel cap at 45 degrees -------------
     bot = sim.x[:, 1] < c[1] - 0.55 * R
@@ -216,6 +254,7 @@ def main():
     n_sub = max(1, int((1.0 / args.fps) / args.dt))
     t0 = time.time()
     phi_peak = torch.zeros(3, device=dev, dtype=sim.dtype)    # [int, flesh, peel], on device
+    phi_shear_peak = torch.zeros((), device=dev, dtype=sim.dtype)  # interface mode-II drive
     for f in range(args.frames):
         sim.run_frame(n_sub, f / args.fps)
         # running phi maxima accumulate on-device -- no host sync per frame
@@ -223,6 +262,9 @@ def main():
         if ph is not None:
             phf = torch.stack([ph[interface].max(), ph[flesh].max(), ph[peel].max()])
             phi_peak = torch.maximum(phi_peak, phf)
+        psh = getattr(sim, "phi_shear", None)
+        if psh is not None:
+            phi_shear_peak = torch.maximum(phi_shear_peak, psh[interface].max())
 
         if (f % args.log_every == 0) or (f == args.frames - 1):
             di, dfl, dpe = sim.d[interface], sim.d[flesh], sim.d[peel]
@@ -254,31 +296,73 @@ def main():
     # equilibrate at d ~ exp(-spacing/l0) by the Laplacian term alone. That
     # halo is the method working, not leakage. Failure means a bystander
     # actually BREAKS (d > 0.5), so that's what we test.
-    exist = float((sim.d[interface] > 0.5).float().mean()) > 0.05
+    broken_int_frac = float((sim.d[interface] > 0.5).float().mean())
+    exist = broken_int_frac > 0.05
     n_out = int((sim.d[flesh] > 0.5).sum()) + int((sim.d[peel] > 0.5).sum())
-    halo = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))
+    d_bystander_max = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))
     halo_pred = math.exp(-spacing / l0)
-    print(f"\n[peel] EXISTENCE (>5% of interface broken): {'PASS' if exist else 'FAIL'}")
-    print(f"[peel] SELECTIVITY (no broken particles outside interface): "
-          f"{'PASS' if n_out == 0 else 'FAIL'} "
-          f"(broken outside={n_out}, halo max d={halo:.2f}, "
-          f"diffuse-band prediction ~{halo_pred:.2f})")
+
+    # routing: interface drive vs the toughest bystander drive.  With contrast and
+    # geometry stripped (Block 1: rho=1, --equal-E) this isolates the structural
+    # tensor's selectivity.  Use the RATIO; iso need not be ~1 (pole geometry
+    # concentrates stress regardless), but correct should route >> iso.
+    pk = phi_peak.cpu().tolist()                              # [int, flesh, peel]
+    phi_bystander_max = max(pk[1], pk[2])
+    routing = pk[0] / (phi_bystander_max + 1e-9)
+
+    # grip-leak check (meaningful, unlike grip_d on the clamped cap which is
+    # frozen by allow=False): max damage in the ALLOWED peel ring just below the
+    # pulled cap.  High here = the pull is tearing at the grip, not delaminating.
+    ring = peel & (~cap) & (cos_up > math.cos(math.radians(args.cap_deg + 15)))
+    grip_d_max = float(sim.d[ring].max()) if int(ring.sum()) > 0 else 0.0
+
+    # directional-stress observable: at damaged interface particles the normal
+    # traction should collapse (normal_release -> 1) while the in-plane stress is
+    # retained (inplane_keep -> 1).  Isotropic g(d) ALSO releases the normal under
+    # tension, but inplane_keep -> 0 there -- so inplane_keep is the discriminant
+    # that the directional split (not just damage) is doing the work.
+    normal_release = inplane_keep = float("nan")
+    tau_last = getattr(sim, "tau_last", None)
+    if tau_last is not None and int(interface.sum()) > 0:
+        sig = tau_last / sim.J_last.view(-1, 1, 1)            # degraded Cauchy stress
+        nrm = r_hat
+        Sn = torch.einsum('pij,pj->pi', sig, nrm)
+        tn = (Sn * nrm).sum(1).abs()                          # |normal traction|
+        Pn = nrm.unsqueeze(2) * nrm.unsqueeze(1)
+        Qn = I3 - Pn
+        sip = (Qn @ sig @ Qn).reshape(sim.n, -1).norm(dim=1)  # in-plane stress mag
+        intact = interface & (sim.d < 0.1)
+        broken = interface & (sim.d > 0.5)
+        if int(intact.sum()) > 0 and int(broken.sum()) > 0:
+            normal_release = 1.0 - float(tn[broken].mean() / (tn[intact].mean() + 1e-9))
+            inplane_keep = float(sip[broken].mean() / (sip[intact].mean() + 1e-9))
+
+    print(f"\n[peel] aniso={args.aniso} directional={args.directional} "
+          f"equal_E={args.equal_E} seed={args.seed}")
+    print(f"[peel] EXISTENCE (>5% interface broken): {'PASS' if exist else 'FAIL'}  "
+          f"(broken_int_frac={broken_int_frac:.3f})")
+    print(f"[peel] SELECTIVITY (no bystander breaks): {'PASS' if n_out == 0 else 'FAIL'}  "
+          f"(broken_outside={n_out}, d_bystander_max={d_bystander_max:.2f}, halo~{halo_pred:.2f})")
+    print(f"[peel] routing phi_int/phi_bystander={routing:.2f}  "
+          f"(phi_int={pk[0]:.2f} phi_bystander={phi_bystander_max:.2f} phi_shear={float(phi_shear_peak):.2f})")
+    print(f"[peel] directional: normal_release={normal_release:.2f} "
+          f"inplane_keep={inplane_keep:.2f}  grip_d_max={grip_d_max:.3f}")
     if not exist:
         print("  -> lower --sigc-frac, raise --speed, or run more --frames")
 
     if args.summary_json:
         import json
-        pk = phi_peak.cpu().tolist()                          # [int, flesh, peel]
         rec = dict(
-            rho=args.rho, pull_deg=args.pull_deg, sigc_frac=args.sigc_frac,
+            aniso=args.aniso, directional=args.directional, equal_E=bool(args.equal_E),
+            seed=args.seed, rho=args.rho, pull_deg=args.pull_deg, sigc_frac=args.sigc_frac,
             speed=args.speed, ngrid=args.ngrid, ppcd=args.ppcd, frames=args.frames,
-            broken_int=float((sim.d[interface] > 0.5).float().mean()),
-            d_int_max=float(sim.d[interface].max()),
-            d_flesh_max=float(sim.d[flesh].max()),
-            d_peel_max=float(sim.d[peel].max()),
-            phi_int_max=pk[0], phi_flesh_max=pk[1],
-            phi_peel_max=pk[2], n_broken_outside=n_out,
-            exist=bool(exist), select=bool(n_out == 0), secs=round(time.time() - t0, 1),
+            phi_int_max=pk[0], phi_bystander_max=phi_bystander_max,
+            phi_flesh_max=pk[1], phi_peel_max=pk[2], phi_shear_max=float(phi_shear_peak),
+            routing=routing, broken_int_frac=broken_int_frac,
+            d_int_max=float(sim.d[interface].max()), d_bystander_max=d_bystander_max,
+            grip_d_max=grip_d_max, normal_release=normal_release, inplane_keep=inplane_keep,
+            n_broken_outside=n_out, exist=bool(exist), select=bool(n_out == 0),
+            nan=bool(torch.isnan(sim.x).any()), secs=round(time.time() - t0, 1),
         )
         with open(args.summary_json, "a") as fh:
             fh.write(json.dumps(rec) + "\n")

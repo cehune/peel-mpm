@@ -21,6 +21,20 @@ of the damage field.  The degradation g multiplies the deviatoric (and tensile
 volumetric) stress so that cracks soften the material in tension/shear but the
 material still resists compression.
 
+Two extensions beyond the baseline port live here:
+  * The damage Laplacian lap(d) is computed with a separate CUBIC B-spline pass
+    (4x4x4), matching the paper's Eqn for Delta d_p = sum_i d_i Delta N_i which
+    "mandates ... at least cubic N_i" -- the quadratic 2nd-derivative stencil is
+    piecewise-constant in sub-cell position, giving a discontinuous (staircase)
+    Laplacian as particles cross cells.  Momentum P2G/G2P stays quadratic, so the
+    MLS-MPM affine factor (4*inv_dx^2) is unchanged.
+  * Delamination ("N1"): at interface particles flagged by set_normal_isolation,
+    the isotropic degradation is replaced by a directional one (see
+    directional_kirchhoff) that releases the normal + shear traction while
+    preserving the in-plane stress, so a peel separates from its substrate while
+    the sheet stays coherent.  energy()/directional_pk1() are the variationally
+    consistent counterpart, validated by 1_fd_check.py.
+
 Everything runs batched on the GPU in float32/float64.
 
 Reference (C++): ziran2020/Projects/anisofracture/AnisoFractureSimulation.h
@@ -89,6 +103,152 @@ def sym_eig(A: torch.Tensor):
 _D2 = (1.0, -2.0, 1.0)
 
 
+# ============================================================================
+#  Directional damage constitutive functions  ("N1": the delamination extension)
+# ----------------------------------------------------------------------------
+#  Anisotropy in this model enters through FAILURE, not elastic stiffness.  The
+#  elastic response stays isotropic fixed-corotated with per-region modulus
+#  contrast; what makes the interface release while the sheet stays coherent is
+#  the *directional degradation* below.  Two legitimate forms:
+#
+#  * Option A -- energy() / directional_pk1():  a variationally consistent pair,
+#    stress = d Psi / d F.  Validated by 1_fd_check.py (central-difference gate).
+#    This is the thermodynamic-consistency story; matrix preserved + mode-I (I4)
+#    and mode-II (I5) cohesion enrichments.  Note: because the matrix term is
+#    preserved, a fully-damaged interface particle keeps bulk stiffness unless
+#    the interface is also a weak band (reduce interface E) -- the Hansen-Doerr
+#    regularized-interface trick.  Kept mainly for the writeup / reviewer rigor.
+#
+#  * Option B -- directional_kirchhoff():  a projection split of the corotated
+#    Kirchhoff stress by the deformed interface normal.  Separates by
+#    construction, needs no new material parameters, reuses the solver's stress.
+#    This is what the solver actually ships (operator split, exactly as Miehe /
+#    Amor / Steinke-Kaliske do -- not the gradient of a single potential, which
+#    is the field standard and footnoted as such).
+#
+#  gI, gII are the mode-I / mode-II degradation functions.  They are SHARED
+#  between energy() and directional_pk1() (this is what makes the FD gate valid)
+#  and MUST match 1_fd_check.py.  The residual 1e-4 keeps the Hessian PD.
+# ============================================================================
+def gI(d):
+    return (1.0 - d) ** 2 + 1e-4
+
+
+def gII(d):
+    return (1.0 - d) ** 2 + 1e-4
+
+
+def energy(F, n0, d, mu, lam, gamma_I, gamma_II):
+    """Option A directional energy density (per particle).
+
+        Psi = mu||F-R||^2 + (lam/2)(J-1)^2                      [matrix, preserved]
+            + gI(d) (gamma_I /2) <lam_n - 1>^2                  [mode I,  from I4]
+            + gII(d)(gamma_II/2) (I5 - I4^2)                    [mode II, from I5]
+
+    with I4 = |F n0|^2 = lam_n^2,  I5 = |C n0|^2,  C = F^T F.  mu, lam, gamma_*
+    are scalars or (N,); n0 is the (N,3) reference interface normal; d is (N,).
+    directional_pk1 is exactly d(this)/dF -- keep the two in lockstep."""
+    U, S, Vh = torch.linalg.svd(F)
+    R = U @ Vh
+    J = torch.linalg.det(F)
+    psi_mat = mu * ((F - R) ** 2).sum((-1, -2)) + 0.5 * lam * (J - 1) ** 2
+    Fn = torch.einsum('pij,pj->pi', F, n0)
+    I4 = (Fn * Fn).sum(-1)
+    lam_n = torch.sqrt(I4)
+    C = torch.einsum('pki,pkj->pij', F, F)
+    Cn = torch.einsum('pij,pj->pi', C, n0)
+    I5 = (Cn * Cn).sum(-1)
+    psi_I = 0.5 * gamma_I * torch.clamp(lam_n - 1.0, min=0.0) ** 2
+    psi_II = 0.5 * gamma_II * (I5 - I4 ** 2)
+    return psi_mat + gI(d) * psi_I + gII(d) * psi_II
+
+
+def directional_pk1(F, n0, d, mu, lam, gamma_I, gamma_II):
+    """Option A first Piola-Kirchhoff stress P = d energy / d F.
+
+    Closed-form gradient of energy() above.  Validated against the numerical
+    gradient of energy() by 1_fd_check.py.  For the solver, convert to Kirchhoff
+    with  tau = P @ F^T  (this is the variational route; the solver actually
+    ships directional_kirchhoff, Option B)."""
+    U, S, Vh = torch.linalg.svd(F)
+    R = U @ Vh
+    J = torch.linalg.det(F)
+    FinvT = torch.linalg.inv(F).transpose(-1, -2)
+    P_mat = 2 * mu * (F - R) + (lam * (J - 1) * J)[..., None, None] * FinvT
+    Fn = torch.einsum('pij,pj->pi', F, n0)
+    C = torch.einsum('pki,pkj->pij', F, F)
+    Cn = torch.einsum('pij,pj->pi', C, n0)
+    I4 = (Fn * Fn).sum(-1)
+    lam_n = torch.sqrt(I4)
+    opening = torch.clamp(lam_n - 1.0, min=0.0)
+    P_I = gamma_I * (opening / lam_n)[..., None, None] * torch.einsum('pi,pj->pij', Fn, n0)
+    FCn = torch.einsum('pij,pj->pi', F, Cn)
+    P_II = gamma_II * (
+        torch.einsum('pi,pj->pij', Fn, Cn)
+        + torch.einsum('pi,pj->pij', FCn, n0)
+        - 2 * I4[..., None, None] * torch.einsum('pi,pj->pij', Fn, n0)
+    )
+    return P_mat + gI(d)[..., None, None] * P_I + gII(d)[..., None, None] * P_II
+
+
+def directional_kirchhoff(tau_c, F, d, n0, gI_fn, gII_fn, tension_gate=True):
+    """Option B directional degradation of the corotated Kirchhoff stress.
+
+    Split tau_c by the *deformed* interface normal  m = F n0 / |F n0|:
+        P = m (x) m,   Q = I - P
+        tau_perp  = P tau_c P                 (mode I, normal traction)
+        tau_shear = P tau_c Q + Q tau_c P     (mode II, interfacial shear)
+        tau_par   = Q tau_c Q                 (in-plane, preserved)
+        tau = tau_par + gI(d) tau_perp + gII(d) tau_shear
+
+    At d=0 (gI=gII=1), since P+Q=I the three pieces sum to (P+Q) tau_c (P+Q) =
+    tau_c, so the intact material is reproduced EXACTLY (reconstruction_check).
+    At d=1 only tau_par survives -> the normal hold releases while the sheet
+    stays coherent in-plane.
+
+    tau_c : (N,3,3) undegraded corotated Kirchhoff stress (reuse the solver's).
+    F     : (N,3,3) deformation gradient (pushes n0 to the spatial frame).
+    n0    : (N,3) reference interface normal.
+    gI_fn, gII_fn : degradation callables of d (mode I / mode II).
+    tension_gate : if True, do NOT soften a *compressive* normal traction
+        (sigma_nn < 0).  Delamination is a tensile/shear failure; softening the
+        compressive normal would let the layers interpenetrate.  This mirrors the
+        solver's J>=1 gate on the volumetric stress and does not touch the d=0
+        reconstruction (gI=1 there regardless)."""
+    m = torch.einsum('pij,pj->pi', F, n0)
+    m = m / (m.norm(dim=1, keepdim=True) + 1e-9)
+    P = torch.einsum('pi,pj->pij', m, m)
+    I3 = torch.eye(3, device=tau_c.device, dtype=tau_c.dtype).expand_as(tau_c)
+    Q = I3 - P
+    tau_perp = P @ tau_c @ P
+    tau_shear = P @ tau_c @ Q + Q @ tau_c @ P
+    tau_par = Q @ tau_c @ Q
+    gIv = gI_fn(d).view(-1, 1, 1)
+    gIIv = gII_fn(d).view(-1, 1, 1)
+    if tension_gate:
+        snn = torch.einsum('pi,pij,pj->p', m, tau_c, m).view(-1, 1, 1)
+        gIv = torch.where(snn > 0.0, gIv, torch.ones_like(gIv))
+    return tau_par + gIv * tau_perp + gIIv * tau_shear
+
+
+def reconstruction_check(F, R, J, n0, mu, lam, verbose=True):
+    """Option B validator: at d=0 the projection split must rebuild the plain
+    corotated stress.  This is the analogue, for Option B, of the dPsi/dF
+    finite-difference gate that validates Option A.  Returns max abs error."""
+    dev, dt = F.device, F.dtype
+    I3 = torch.eye(3, device=dev, dtype=dt).expand_as(F)
+    mu_ = mu.view(-1, 1, 1) if torch.is_tensor(mu) and mu.dim() == 1 else mu
+    lam_ = lam.view(-1) if torch.is_tensor(lam) and lam.dim() == 1 else lam
+    tau_c = 2.0 * mu_ * (F - R) @ F.transpose(1, 2) + (lam_ * (J - 1.0) * J).view(-1, 1, 1) * I3
+    d0 = torch.zeros(F.shape[0], device=dev, dtype=dt)
+    one = lambda dd: torch.ones_like(dd)
+    tau_split = directional_kirchhoff(tau_c, F, d0, n0, one, one)
+    err = (tau_split - tau_c).abs().max().item()
+    if verbose:
+        print(f"reconstruction_check: max|split(d=0) - corotated| = {err:.2e}")
+    return err
+
+
 class AnisoMPM:
     def __init__(
         self,
@@ -115,10 +275,21 @@ class AnisoMPM:
         self.damage_every = max(1, int(damage_every))
         self._step = 0
 
-        # 27-neighbour offsets for the 3x3x3 quadratic kernel
+        # 27-neighbour offsets for the 3x3x3 quadratic kernel (momentum)
         off = torch.arange(3, device=self.device)
         gx, gy, gz = torch.meshgrid(off, off, off, indexing="ij")
         self.offsets = torch.stack([gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], 1)  # (27,3) int
+
+        # 64-neighbour offsets for the 4x4x4 CUBIC kernel (damage Laplacian only).
+        # The paper mandates >= cubic for lap(d): the cubic 2nd derivative is
+        # linear in the sub-cell coordinate, so the recovered Laplacian is smooth,
+        # whereas the quadratic (1,-2,1) stencil is constant in sub-cell position
+        # -> a piecewise-constant Laplacian that jumps as particles cross cells
+        # (the crack-band noise).  Momentum stays quadratic so the MLS-MPM affine
+        # factor 4*inv_dx^2 is untouched (cubic would need 3*inv_dx^2).
+        off4 = torch.arange(4, device=self.device)
+        g4x, g4y, g4z = torch.meshgrid(off4, off4, off4, indexing="ij")
+        self.offsets4 = torch.stack([g4x.reshape(-1), g4y.reshape(-1), g4z.reshape(-1)], 1)  # (64,3)
 
         self.colliders = []          # list of callables(state, time)->None acting on grid_v
         self.particle_bc = []        # list of callables(self, time)->None acting on particle v before p2g
@@ -160,6 +331,11 @@ class AnisoMPM:
         new["lam"] = torch.full((N,), lam, device=dev, dtype=dt)
         new["d"] = torch.zeros(N, device=dev, dtype=dt)
         new["lap"] = torch.zeros(N, device=dev, dtype=dt)
+        # interface bookkeeping for the directional (delamination) stress.
+        # Populated by set_normal_isolation(); all-False here means the
+        # directional stress is a no-op (pure isotropic g(d) degradation).
+        new["n_interface"] = torch.zeros(N, 3, device=dev, dtype=dt)
+        new["interface_mask"] = torch.zeros(N, device=dev, dtype=torch.bool)
 
         if fibers is None or alpha == 0.0:
             new["a0"] = torch.zeros(N, 3, device=dev, dtype=dt)
@@ -204,6 +380,7 @@ class AnisoMPM:
             self.vol0 = new["vol0"]; self.mass = new["mass"]
             self.mu = new["mu"]; self.lam = new["lam"]
             self.d = new["d"]; self.lap = new["lap"]
+            self.n_interface = new["n_interface"]; self.interface_mask = new["interface_mask"]
             self.a0 = new["a0"]; self.alpha = new["alpha"]
             self.A0 = new["A0"]
             self.sigma_c = new["sigma_c"]; self.eta = new["eta"]
@@ -220,6 +397,8 @@ class AnisoMPM:
             self.vol0 = cat(self.vol0, new["vol0"]); self.mass = cat(self.mass, new["mass"])
             self.mu = cat(self.mu, new["mu"]); self.lam = cat(self.lam, new["lam"])
             self.d = cat(self.d, new["d"]); self.lap = cat(self.lap, new["lap"])
+            self.n_interface = cat(self.n_interface, new["n_interface"])
+            self.interface_mask = cat(self.interface_mask, new["interface_mask"])
             self.a0 = cat(self.a0, new["a0"]); self.alpha = cat(self.alpha, new["alpha"])
             self.A0 = cat(self.A0, new["A0"])
             self.sigma_c = cat(self.sigma_c, new["sigma_c"]); self.eta = cat(self.eta, new["eta"])
@@ -276,10 +455,14 @@ class AnisoMPM:
         self.A0 = torch.where(mask.view(-1, 1, 1), A, self.A0)
         return self
 
-    def set_normal_isolation(self, mask, normals):
-        """Convenience wrapper: isolate the normal traction via A0 = n (x) n.
-
-        Equivalent to set_structural_tensor(mask, n n^T) with n normalised.
+    def set_interface_normals(self, mask, normals):
+        """Register interface normals for the directional (delamination) stress
+        WITHOUT touching the damage driver A0.  Decouples the stress model
+        (directional vs isotropic) from the driver tensor, so you can A/B
+        'directional on/off' with the damage routing held fixed.  Sets
+        self.n_interface and flags self.interface_mask, which switches substep()
+        to degrade these particles with directional_kirchhoff() (release
+        normal + shear, preserve in-plane) instead of the isotropic g(d).
         `normals` may be (N,3) or (M,3) for the M masked rows."""
         mask = torch.as_tensor(mask, device=self.device).bool()
         nrm = torch.as_tensor(normals, device=self.device, dtype=self.dtype)
@@ -288,7 +471,20 @@ class AnisoMPM:
             full[mask] = nrm
             nrm = full
         nrm = nrm / (nrm.norm(dim=1, keepdim=True) + 1e-12)
-        nn = nrm.unsqueeze(2) * nrm.unsqueeze(1)
+        self.n_interface = torch.where(mask.view(-1, 1), nrm, self.n_interface)
+        self.interface_mask = self.interface_mask | mask
+        return self
+
+    def set_normal_isolation(self, mask, normals):
+        """Convenience: isolate the normal traction via A0 = n (x) n (damage
+        DRIVING, phi = (sigma_nn^+/sigma_c)^2) AND register n for the directional
+        stress (mechanical RESPONSE).  Equivalent to set_interface_normals(mask,n)
+        followed by set_structural_tensor(mask, n n^T).  Call the two separately
+        to decouple the driver tensor from the stress model (e.g. iso driver with
+        directional release, or normal driver with the bonded baseline)."""
+        self.set_interface_normals(mask, normals)
+        mask = torch.as_tensor(mask, device=self.device).bool()
+        nn = self.n_interface.unsqueeze(2) * self.n_interface.unsqueeze(1)
         return self.set_structural_tensor(mask, nn[mask])
 
     # ---------------------------------------------------------------- kernels
@@ -306,6 +502,33 @@ class AnisoMPM:
         ], dim=1)                                             # (N,3nodes,3dims)
         w2 = torch.tensor(_D2, device=self.device, dtype=self.dtype)  # (3,)
         return base, fx, w, w2
+
+    def _cubic_weights(self, x):
+        """Cubic B-spline per-axis weights + 2nd derivatives (in GRID units) for
+        the damage Laplacian.  4-node support: base = floor(Xp) - 1, and
+        f = frac(Xp) in [0,1).  The four weights and their second derivatives are
+
+            w0 = (1/6)(1-f)^3            w0'' = 1 - f
+            w1 = 2/3 - f^2 + (1/2)f^3    w1'' = 3f - 2
+            w2 = 2/3 - (1-f)^2 + (1/2)(1-f)^3   w2'' = 1 - 3f
+            w3 = (1/6)f^3               w3'' = f
+
+        sum w = 1 and sum w'' = 0 (consistency); the w'' are LINEAR in f, which is
+        exactly why the cubic Laplacian is smooth where the quadratic one jumps.
+        Multiply the assembled stencil by inv_dx^2 for the physical Laplacian.
+        Returns base (N,3 int), f (N,3), w (N,4,3), w2 (N,4,3)."""
+        Xp = x * self.inv_dx
+        base = torch.floor(Xp).to(torch.long) - 1            # 4-node support
+        f = Xp - (base + 1).to(self.dtype)                   # frac(Xp) in [0,1)
+        one = 1.0 - f
+        w = torch.stack([
+            (1.0 / 6.0) * one ** 3,
+            2.0 / 3.0 - f ** 2 + 0.5 * f ** 3,
+            2.0 / 3.0 - one ** 2 + 0.5 * one ** 3,
+            (1.0 / 6.0) * f ** 3,
+        ], dim=1)                                            # (N,4,3)
+        w2 = torch.stack([one, 3.0 * f - 2.0, 1.0 - 3.0 * f, f], dim=1)  # (N,4,3)
+        return base, f, w, w2
 
     def _node_index(self, nodes):
         """Flatten (M,3) integer node coords to linear index, clamped to grid."""
@@ -376,6 +599,14 @@ class AnisoMPM:
             M = A @ sigma_p
             phi = (M @ M).diagonal(dim1=1, dim2=2).sum(1) / (self.sigma_c ** 2)
             self.phi = phi                                    # expose for diagnostics
+            # mode-II (shear) drive at interface particles, for the cos^2 test:
+            # |(I - n n^T) sigma^+ n| / sigma_c, squared.  Zero where no interface
+            # normal is registered.  Lets a shear-driven high-angle delamination be
+            # told apart from a cos^2(theta) violation of the normal drive.
+            Sn = torch.einsum('pij,pj->pi', sigma_p, self.n_interface)
+            tn_s = (Sn * self.n_interface).sum(1, keepdim=True)
+            tt_s = (Sn - tn_s * self.n_interface).norm(dim=1)
+            self.phi_shear = (tt_s / self.sigma_c) ** 2
             dTilde = self.zeta * torch.relu(phi - 1.0)
             resist = self.d - (self.l0 ** 2) * self.lap
             ddot = torch.relu((1.0 - self.d) * dTilde - resist)
@@ -389,12 +620,24 @@ class AnisoMPM:
         vol_deg = torch.where((J >= 1.0).view(-1, 1, 1), gv, torch.ones_like(gv))
         tau = gv * tau_dev + vol_deg * tau_vol
 
-        # ---- P2G -------------------------------------------------------------
+        # directional (delamination) stress at registered interface particles:
+        # replace the isotropic g(d) degradation there with the projection split
+        # (release normal + interfacial shear, preserve in-plane).  No-op unless
+        # set_normal_isolation() flagged some particles -> backward compatible.
+        if bool(self.interface_mask.any()):
+            res = self.residual.view(-1)                      # (N,) residual k_r
+            g_dir = lambda dd: (1.0 - dd) ** 2 * (1.0 - res) + res
+            tau_c_full = tau_dev + tau_vol                    # undegraded corotated
+            tau_dir = directional_kirchhoff(tau_c_full, F, self.d, self.n_interface,
+                                            g_dir, g_dir, tension_gate=True)
+            tau = torch.where(self.interface_mask.view(-1, 1, 1), tau_dir, tau)
+
+        self.tau_last = tau               # diagnostics: degraded Kirchhoff stress
+        self.J_last = J                   # and J (for the normal-release observable)
+        # ---- P2G (momentum only; quadratic) ---------------------------------
         base, fx, w, w2 = self._weights(self.x)
         grid_mv = torch.zeros(ngrid3, 3, device=dev, dtype=dt)
         grid_m = torch.zeros(ngrid3, device=dev, dtype=dt)
-        grid_d = torch.zeros(ngrid3, device=dev, dtype=dt)
-        grid_dw = torch.zeros(ngrid3, device=dev, dtype=dt)
 
         stress_coeff = (-dtt * self.vol0 * 4.0 * inv_dx * inv_dx).view(-1, 1, 1)
         affine = stress_coeff * tau + self.mass.view(-1, 1, 1) * self.C   # (N,3,3)
@@ -409,8 +652,6 @@ class AnisoMPM:
             contrib = wk.unsqueeze(1) * (mv + (affine @ dpos.unsqueeze(-1)).squeeze(-1))
             grid_mv.index_add_(0, idx, contrib)
             grid_m.index_add_(0, idx, wk * self.mass)
-            grid_d.index_add_(0, idx, wk * self.d)
-            grid_dw.index_add_(0, idx, wk)
 
         # ---- grid update -----------------------------------------------------
         mask = grid_m > 1e-12
@@ -421,11 +662,6 @@ class AnisoMPM:
         if self.grid_damp != 1.0:
             grid_v = grid_v * self.grid_damp
         grid_v[~mask] = 0.0
-
-        # normalize damage field on grid (for Laplacian)
-        gd = torch.zeros_like(grid_d)
-        dwm = grid_dw > 1e-12
-        gd[dwm] = grid_d[dwm] / grid_dw[dwm]
 
         # colliders act on grid velocity (positions of active nodes)
         if self.colliders:
@@ -439,10 +675,9 @@ class AnisoMPM:
                 vsel = col(pos, vsel, time)
             grid_v[node_lin] = vsel
 
-        # ---- G2P + Laplacian -------------------------------------------------
+        # ---- G2P (momentum only; quadratic) ---------------------------------
         new_v = torch.zeros_like(self.v)
         new_C = torch.zeros_like(self.C)
-        lap = torch.zeros(self.n, device=dev, dtype=dt)
         for k in range(27):
             ox, oy, oz = self.offsets[k]
             nodes = base + self.offsets[k]
@@ -452,23 +687,48 @@ class AnisoMPM:
             dpos = (self.offsets[k].to(dt) - fx) * self.dx
             new_v = new_v + wk.unsqueeze(1) * gvk
             new_C = new_C + wk.unsqueeze(1).unsqueeze(2) * (gvk.unsqueeze(2) * dpos.unsqueeze(1))
-            # Laplacian weight = inv_dx^2 ( d2x wy wz + wx d2y wz + wx wy d2z )
+        new_C = new_C * (4.0 * inv_dx * inv_dx)
+
+        # ---- damage field -> grid -> Laplacian, CUBIC (decoupled) -----------
+        # Separate 4x4x4 pass: scatter d with cubic weights, normalise to gd,
+        # then gather the cubic-stencil Laplacian.  Uses the start-of-substep
+        # positions (self.x not yet advected), so lap is consistent with the
+        # current d and lags exactly one step as before.  Only this pass is
+        # cubic; momentum stays quadratic so the affine factor is untouched.
+        base_c, _, wc, wc2 = self._cubic_weights(self.x)
+        grid_dc = torch.zeros(ngrid3, device=dev, dtype=dt)
+        grid_dwc = torch.zeros(ngrid3, device=dev, dtype=dt)
+        for k in range(64):
+            ox, oy, oz = self.offsets4[k]
+            idx = self._node_index(base_c + self.offsets4[k])
+            wk = wc[:, ox, 0] * wc[:, oy, 1] * wc[:, oz, 2]
+            grid_dc.index_add_(0, idx, wk * self.d)
+            grid_dwc.index_add_(0, idx, wk)
+        gd = torch.zeros_like(grid_dc)
+        dwm = grid_dwc > 1e-12
+        gd[dwm] = grid_dc[dwm] / grid_dwc[dwm]
+
+        lap = torch.zeros(self.n, device=dev, dtype=dt)
+        for k in range(64):
+            ox, oy, oz = self.offsets4[k]
+            idx = self._node_index(base_c + self.offsets4[k])
+            # inv_dx^2 ( w''x wy wz + wx w''y wz + wx wy w''z )
             lapw = inv_dx * inv_dx * (
-                w2[ox] * w[:, oy, 1] * w[:, oz, 2]
-                + w[:, ox, 0] * w2[oy] * w[:, oz, 2]
-                + w[:, ox, 0] * w[:, oy, 1] * w2[oz]
+                wc2[:, ox, 0] * wc[:, oy, 1] * wc[:, oz, 2]
+                + wc[:, ox, 0] * wc2[:, oy, 1] * wc[:, oz, 2]
+                + wc[:, ox, 0] * wc[:, oy, 1] * wc2[:, oz, 2]
             )
             lap = lap + lapw * gd[idx]
 
-        new_C = new_C * (4.0 * inv_dx * inv_dx)
         self.v = new_v
         self.C = new_C
         self.lap = lap
         self.x = self.x + dtt * self.v
         self.F = (I3 + dtt * self.C) @ self.F
 
-        # keep particles inside the domain (soft clamp)
-        pad = 1.5 * self.dx
+        # keep particles inside the domain (soft clamp).  2*dx (not 1.5*dx) so the
+        # 4-node cubic support of the damage pass stays in-domain.
+        pad = 2.0 * self.dx
         self.x = self.x.clamp(pad, self.grid_lim - pad)
         self._step += 1
 

@@ -1,81 +1,115 @@
 #!/usr/bin/env bash
 # =============================================================================
-# AnisoMPM delamination validation gate  (revised)
+# AnisoMPM delamination validation gate
 # =============================================================================
-# Fixes vs the original plan:
-#   * commands actually run -- every flag below exists in peel_test.py now
-#     (--aniso, --directional, --equal-E, --seed) and 1_fd_check.py is the real
-#     file name.
-#   * BLOCK D is NEW: it isolates the directional STRESS (the thing we added),
-#     which the original plan never tested -- all its observables were downstream
-#     of the damage DRIVER (phi), which is identical whether the stress split is
-#     on or off.  Block D holds the driver fixed and flips --directional, and the
-#     verdict keys on inplane_keep (only the directional split preserves it).
-#   * routing is compared as a RATIO (correct vs iso), not "iso ~ 1": pole
-#     geometry concentrates stress regardless of A0.
-#   * grip leak is measured in the ALLOWED peel ring below the cap, not on the
-#     clamped cap (whose damage is frozen to 0 and can never fail the check).
-#   * seed robustness at the load-bearing cells.
+# Run order matters: each stage can veto the next, so a confounded green is
+# impossible.  Stages:
+#   PREFLIGHT  LA self-test            -- is the analytic eig/polar sound here?
+#   GATE 0a    1_fd_check (A,B,C)      -- math: dPsi/dF, d=0 reconstruction, AND
+#                                         d=1 RELEASE (Gate 3 tells a peel from
+#                                         its opposite; the others cannot).
+#   GATE 0b    positive control        -- maximally-helped cell MUST delaminate.
+#   GATE 0b'   aggressive smoke        -- harsh cell must stay finite (the gentle
+#                                         control does not certify the harsh cells).
+#   [NaN stop] if a smoke went non-finite, the ball is unstable at this
+#              resolution -- STOP, the whole sweep below would be NaN.
+#   BLOCK D    directional STRESS       -- split fires (smoke) AND sheet separates
+#                                         (kinematic normal-gap; not the circular ratio).
+#   BLOCK 1    driver mechanism         -- correct/iso/wrong differ ONLY in A0;
+#                                         verdict keys on the routing RATIO.
+#   BLOCK 2    angular law              -- within-run phi_int/phi_shear ~ cot^2(theta);
+#                                         slope ~ +1 correct, < 0 wrong, scatter iso.
+#   BLOCK 3    toughness threshold      -- SELECT holds for some rho* > 1.
+#   BLOCK 4    numerics                 -- vary grid and particles SEPARATELY;
+#                                         verdict invariant (halo-aware selectivity).
+#   VERDICT    gate_verdict.py          -- reduces validate.jsonl to PASS_0..4,D + GATE.
 #
-# Each run appends one JSON record to out/validate.jsonl; gate_verdict.py reduces
-# it to PASS_0..4 + PASS_D + GATE.
+# Equation consistency (vs Wolper et al. 2020): driver Phi=(A s+ : s+ A)/sigma_c^2
+# (Eq.8), evolution Eq.11 with HISTORY-MAX drive, g(d)=(1-d)^2(1-r)+r (Eq.10),
+# Laplacian via a CUBIC B-spline pass (Eq. under 4.3.1 mandates >= cubic),
+# l0 = dx/2, zeta = 1.  See the consistency notes in anisompm.py.
 #
-# Usage:   DEV=mps FRAMES=48 bash src/run_gate.sh      # mac GPU, full
-#          DEV=cuda:0 bash src/run_gate.sh             # cuda box
-#          bash src/run_gate.sh                        # cpu, default FRAMES
+# Usage:
+#   DEV=cuda:0 bash src/run_gate.sh           # your NVIDIA box (recommended)
+#   DEV=cuda:0 FRAMES=48 bash src/run_gate.sh # more frames if damage is slow
+#   bash src/run_gate.sh                       # auto: cuda -> mps -> cpu
 # Notes:
-#   * On a GPU each run is seconds; on CPU it is minutes -- use a GPU for the
-#     full gate, or FRAMES=12 NG-small for a quick smoke.
-#   * peel_test.py hardcodes f_clamp=(0.35,2.8).  In float32 the analytic polar
-#     decomposition is only ~1e-2 accurate (see the LA self-test) and the clamp
-#     rebuild can NaN on aggressive configs.  If you see nan=true, that is the
-#     pre-existing f_clamp/float32 issue, not the gate -- rerun that cell with a
-#     gentler --speed or move the polar step to float64.
-set -e
-cd "$(dirname "$0")/.."                       # -> anisompm_py
+#   * f_clamp is pinned to none: the float32 analytic polar (~1e-2, see preflight)
+#     makes the clamp REBUILD NaN on aggressive cells -- pre-existing; none is
+#     stable and still develops damage.
+#   * Gate 3 validates against RES (the residual peel_test ships at the interface),
+#     not a different one -- validate what you run.
+set -euo pipefail
+cd "$(dirname "$0")/.."                          # -> anisompm_py
 PY=python3
-DEV=${DEV:-cpu}
-FRAMES=${FRAMES:-32}
+DEV=${DEV:-auto}                                 # cuda:0 / mps / cpu / auto
+FRAMES=${FRAMES:-48}
+NG=${NG:-64}
+RES=${RES:-0.005}                                # = peel_test interface residual
 J=out/validate.jsonl
 S=src/peel_test.py
-C="--device $DEV --frames $FRAMES --plot-every 0 --f-clamp none --summary-json $J"
+C="--device $DEV --ngrid $NG --frames $FRAMES --f-clamp none --plot-every 0 --summary-json $J"
 mkdir -p out
-: > "$J"                                       # one clean gate run
+: > "$J"                                          # one clean gate run
 
-echo "### GATE 0a -- math gate (directional_pk1 == dPsi/dF + Option B reconstruction)"
-$PY src/1_fd_check.py --tol 1e-6 --summary-json "$J"
+echo "############ PREFLIGHT -- analytic linear-algebra self-test ############"
+# Informational: float32 polar is ~1e-2 for near-degenerate stretch (-> 'CHECK').
+# Run on cpu -- it is a device-independent check of the analytic eig/polar math;
+# the gate runs --f-clamp none so this does not gate, but a hard FAIL here means
+# the eig path is broken and every Phi downstream is suspect.
+$PY src/anisompm.py cpu 2>/dev/null | sed -n '/LA self-test/,$p' || true
 
-echo "### GATE 0b -- maximally-helped positive control (must obviously delaminate)"
+echo "############ GATE 0a -- math (Gate1 dPsi/dF, Gate2 recon, Gate3 RELEASE) #"
+$PY src/1_fd_check.py --tol 1e-6 --res "$RES" --summary-json "$J"
+
+echo "############ GATE 0b -- positive control (must obviously delaminate) #####"
 $PY $S --aniso correct --directional on --rho 0.1 --pull-deg 0 $C
 
-echo "### BLOCK D -- directional STRESS isolation (driver fixed, flip the stress model)"
+echo "############ GATE 0b' -- aggressive stability smoke (harsh cell finite?) #"
+$PY $S --aniso correct --directional on --rho 2 --pull-deg 80 $C
+
+echo "############ NaN STOP -- abort the sweep if a smoke diverged #############"
+$PY - "$J" <<'PYEOF'
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+smk = [r for r in recs if r.get("aniso")][-2:]   # the two smoke cells
+if any(r.get("nan") for r in smk) or not smk:
+    print("STOP: a stability smoke produced NaN (ball unstable at this resolution).")
+    print("      lower --dt/--speed or raise --ngrid; the sweep below would be all-NaN.")
+    sys.exit(1)
+print("stability smokes finite -- proceeding.")
+PYEOF
+
+echo "############ BLOCK D -- directional STRESS isolation #####################"
 $PY $S --aniso correct --directional on  --rho 1 --pull-deg 0 --equal-E $C
 $PY $S --aniso correct --directional off --rho 1 --pull-deg 0 --equal-E $C
 
-echo "### BLOCK 1 -- driver mechanism (rho1 + equal-E: correct/iso/wrong differ ONLY in A0)"
+echo "############ BLOCK 1 -- driver mechanism (rho1 + equal-E -> only A0) #####"
 for A in correct iso wrong; do
-  $PY $S --aniso $A --directional on --rho 1 --pull-deg 0 --equal-E $C
+  $PY $S --aniso "$A" --directional on --rho 1 --pull-deg 0 --equal-E $C
 done
 
-echo "### BLOCK 2 -- direction signature (phi_int ~ cos^2(theta); phi_shear logged)"
+echo "############ BLOCK 2 -- angular law phi_int/phi_shear ~ cot^2(theta) #####"
+# pull_deg=0 already spans every theta over the shell (the within-run fit); the
+# extra angles are corroboration / mode-II logging, not separate fit points.
 for a in 0 30 60 80; do
-  $PY $S --aniso correct --directional on --rho 1 --pull-deg $a --equal-E $C
+  $PY $S --aniso correct --directional on --rho 1 --pull-deg "$a" --equal-E $C
 done
 
-echo "### BLOCK 3 -- toughness threshold (SELECT must hold for some rho* > 1)"
+echo "############ BLOCK 3 -- toughness threshold (SELECT holds for rho* > 1) ##"
 for r in 0.5 1 1.5 2; do
-  $PY $S --aniso correct --directional on --rho $r --pull-deg 0 $C
+  $PY $S --aniso correct --directional on --rho "$r" --pull-deg 0 $C
 done
 
-echo "### BLOCK 4 -- numerics (vary grid and particles SEPARATELY; verdict must be invariant)"
-$PY $S --aniso correct --directional on --rho 1 --pull-deg 0 --equal-E --ngrid 96 $C   # finer grid only
-$PY $S --aniso correct --directional on --rho 1 --pull-deg 0 --equal-E --ppcd 2.5 $C   # finer particles only
+echo "############ BLOCK 4 -- numerics (grid and particles varied SEPARATELY) ##"
+$PY $S --aniso correct --directional on --rho 1 --pull-deg 0 --equal-E --ngrid 96 $C   # finer grid
+$PY $S --aniso correct --directional on --rho 1 --pull-deg 0 --equal-E --ppcd 2.5 $C   # finer particles
 
-echo "### seed robustness at the load-bearing cells (Block 1 iso, Block 3 threshold)"
+echo "############ seed robustness at the load-bearing cells ###################"
 for s in 1 2; do
-  $PY $S --aniso iso     --directional on --rho 1   --pull-deg 0 --equal-E --seed $s $C
-  $PY $S --aniso correct --directional on --rho 1.5 --pull-deg 0          --seed $s $C
+  $PY $S --aniso iso     --directional on --rho 1   --pull-deg 0 --equal-E --seed "$s" $C
+  $PY $S --aniso correct --directional on --rho 1.5 --pull-deg 0          --seed "$s" $C
 done
 
-echo "### VERDICT"
+echo "############ VERDICT #####################################################"
 $PY src/gate_verdict.py "$J"

@@ -251,10 +251,13 @@ def main():
     run_dir = os.path.join(args.out, tag)
     os.makedirs(run_dir, exist_ok=True)
     print(f"[peel] outputs -> {run_dir}")
+    x0 = sim.x.clone()                                        # initial positions (Block-D gap)
     n_sub = max(1, int((1.0 / args.fps) / args.dt))
     t0 = time.time()
     phi_peak = torch.zeros(3, device=dev, dtype=sim.dtype)    # [int, flesh, peel], on device
     phi_shear_peak = torch.zeros((), device=dev, dtype=sim.dtype)  # interface mode-II drive
+    phi_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)  # per-particle phi peak (Block 2)
+    psh_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)  # per-particle phi_shear peak
     for f in range(args.frames):
         sim.run_frame(n_sub, f / args.fps)
         # running phi maxima accumulate on-device -- no host sync per frame
@@ -262,9 +265,11 @@ def main():
         if ph is not None:
             phf = torch.stack([ph[interface].max(), ph[flesh].max(), ph[peel].max()])
             phi_peak = torch.maximum(phi_peak, phf)
+            phi_pp = torch.maximum(phi_pp, ph)
         psh = getattr(sim, "phi_shear", None)
         if psh is not None:
             phi_shear_peak = torch.maximum(phi_shear_peak, psh[interface].max())
+            psh_pp = torch.maximum(psh_pp, psh)
 
         if (f % args.log_every == 0) or (f == args.frames - 1):
             di, dfl, dpe = sim.d[interface], sim.d[flesh], sim.d[peel]
@@ -298,9 +303,16 @@ def main():
     # actually BREAKS (d > 0.5), so that's what we test.
     broken_int_frac = float((sim.d[interface] > 0.5).float().mean())
     exist = broken_int_frac > 0.05
-    n_out = int((sim.d[flesh] > 0.5).sum()) + int((sim.d[peel] > 0.5).sum())
-    d_bystander_max = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))
+    # halo-aware bystander-break threshold.  The diffuse Laplacian halo is
+    # halo_pred = exp(-spacing/l0) = exp(-2/ppcd) -- it depends on ppcd, NOT ngrid,
+    # and RISES with ppcd (0.37 @ ppcd2, 0.45 @ ppcd2.5).  A flat 0.5 threshold
+    # false-FAILs selectivity at high ppcd -- the exact numerical artifact Block 4
+    # exists to rule out, induced by the metric.  Tie the threshold to the halo so
+    # the margin (and the verdict) is ppcd-invariant.
     halo_pred = math.exp(-spacing / l0)
+    break_thresh = max(0.5, halo_pred + 0.25)               # 0.62 @ ppcd2, 0.70 @ ppcd2.5
+    n_out = int((sim.d[flesh] > break_thresh).sum()) + int((sim.d[peel] > break_thresh).sum())
+    d_bystander_max = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))
 
     # routing: interface drive vs the toughest bystander drive.  With contrast and
     # geometry stripped (Block 1: rho=1, --equal-E) this isolates the structural
@@ -309,6 +321,30 @@ def main():
     pk = phi_peak.cpu().tolist()                              # [int, flesh, peel]
     phi_bystander_max = max(pk[1], pk[2])
     routing = pk[0] / (phi_bystander_max + 1e-9)
+
+    # --- Block 2: angular law via the magnitude-free ratio ---------------------
+    # The initiation criterion is phi_int/phi_shear ~ cot^2(theta_n).  IMPORTANT:
+    # the normal driver squares an already-quadratic traction, so phi_int ~ cos^4
+    # (NOT cos^2) -- plotting phi_int alone vs cos^2 looks superlinear by design.
+    # The RATIO cancels the load magnitude and is the exact LHS of the criterion.
+    # At pull_deg=0 the shell presents every theta_n in [0,90], so ONE run fits
+    # the whole law.  log-log slope -> +1 for 'correct' (normal driver), < 0 for
+    # 'wrong' (shear driver tracks sin^2), and scatters (low R^2) for 'iso'.
+    cth = (r_hat @ pull_dir).clamp(-1.0, 1.0)                 # cos(theta_n) per particle
+    loaded = interface & (cth > 0) & (phi_pp > 1e-6) & (psh_pp > 1e-9)
+    cos2_slope = float("nan"); cos2_r2 = float("nan"); cos2_n = int(loaded.sum())
+    if cos2_n > 8:
+        cos2 = cth[loaded] ** 2
+        sin2 = (1.0 - cos2).clamp(min=1e-6)
+        ratio_pred = cos2 / sin2                              # cot^2(theta_n)
+        ratio_obs = phi_pp[loaded] / (psh_pp[loaded] + 1e-12)
+        m2 = (ratio_obs > 1e-6) & (ratio_pred > 1e-3) & (ratio_pred < 1e3)
+        if int(m2.sum()) > 8:
+            X = torch.log(ratio_pred[m2]); Y = torch.log(ratio_obs[m2])
+            Xb = X - X.mean(); Yb = Y - Y.mean()
+            cos2_slope = float((Xb @ Yb) / (Xb @ Xb + 1e-12))
+            ss_res = float(((Yb - cos2_slope * Xb) ** 2).sum())
+            cos2_r2 = 1.0 - ss_res / (float((Yb ** 2).sum()) + 1e-12)
 
     # grip-leak check (meaningful, unlike grip_d on the clamped cap which is
     # frozen by allow=False): max damage in the ALLOWED peel ring just below the
@@ -337,16 +373,43 @@ def main():
             normal_release = 1.0 - float(tn[broken].mean() / (tn[intact].mean() + 1e-9))
             inplane_keep = float(sip[broken].mean() / (sip[intact].mean() + 1e-9))
 
+    # Block-D KINEMATIC outcome (de-tautologized): inplane_keep above is read off
+    # tau_last = the split itself, so it is ~>1 for 'on' by construction (keep it
+    # only as an integration smoke that the split fires).  The OUTCOME that proves
+    # delamination is a normal GAP opening at the interface while the peel stays
+    # intact (sheet lifts) -- with isotropic g(d) the same separation needs the
+    # interface mushed, so the gap doesn't cleanly open and the peel itself damages.
+    # gap = increase in distance from each interface particle to nearest flesh.
+    normal_gap = float("nan")
+    d_peel_max = float(sim.d[peel].max()) if int(peel.sum()) > 0 else float("nan")
+    if int(interface.sum()) > 0 and int(flesh.sum()) > 0:
+        fi = torch.nonzero(interface, as_tuple=False).squeeze(1)
+        ff = torch.nonzero(flesh, as_tuple=False).squeeze(1)
+        if ff.numel() > 20000:                                # bound memory at fine res
+            ff = ff[torch.randperm(ff.numel(), device=dev)[:20000]]
+
+        def _nn(Xq, Xref, chunk=4096):
+            out = torch.empty(Xq.shape[0], device=dev, dtype=sim.dtype)
+            for i in range(0, Xq.shape[0], chunk):
+                out[i:i + chunk] = torch.cdist(Xq[i:i + chunk], Xref).min(dim=1).values
+            return out
+        gap = (_nn(sim.x[fi], sim.x[ff]) - _nn(x0[fi], x0[ff])).clamp(min=0.0)
+        br_i = sim.d[fi] > 0.5
+        normal_gap = float(gap[br_i].mean()) if int(br_i.sum()) > 0 else 0.0
+
     print(f"\n[peel] aniso={args.aniso} directional={args.directional} "
           f"equal_E={args.equal_E} seed={args.seed}")
     print(f"[peel] EXISTENCE (>5% interface broken): {'PASS' if exist else 'FAIL'}  "
           f"(broken_int_frac={broken_int_frac:.3f})")
     print(f"[peel] SELECTIVITY (no bystander breaks): {'PASS' if n_out == 0 else 'FAIL'}  "
-          f"(broken_outside={n_out}, d_bystander_max={d_bystander_max:.2f}, halo~{halo_pred:.2f})")
+          f"(broken_outside={n_out}, d_bystander_max={d_bystander_max:.2f}, "
+          f"thresh={break_thresh:.2f}, halo~{halo_pred:.2f})")
     print(f"[peel] routing phi_int/phi_bystander={routing:.2f}  "
           f"(phi_int={pk[0]:.2f} phi_bystander={phi_bystander_max:.2f} phi_shear={float(phi_shear_peak):.2f})")
-    print(f"[peel] directional: normal_release={normal_release:.2f} "
-          f"inplane_keep={inplane_keep:.2f}  grip_d_max={grip_d_max:.3f}")
+    print(f"[peel] Block2 angular law: phi_int/phi_shear ~ cot^2(theta) "
+          f"slope={cos2_slope:.2f} R2={cos2_r2:.2f} n={cos2_n} (want slope~+1 for correct)")
+    print(f"[peel] Block-D outcome: normal_gap={normal_gap:.4f} d_peel_max={d_peel_max:.2f}  "
+          f"| inplane_keep={inplane_keep:.2f} (wiring smoke)  grip_d_max={grip_d_max:.3f}")
     if not exist:
         print("  -> lower --sigc-frac, raise --speed, or run more --frames")
 
@@ -359,8 +422,11 @@ def main():
             phi_int_max=pk[0], phi_bystander_max=phi_bystander_max,
             phi_flesh_max=pk[1], phi_peel_max=pk[2], phi_shear_max=float(phi_shear_peak),
             routing=routing, broken_int_frac=broken_int_frac,
+            cos2_slope=cos2_slope, cos2_r2=cos2_r2, cos2_n=cos2_n,
             d_int_max=float(sim.d[interface].max()), d_bystander_max=d_bystander_max,
+            d_peel_max=d_peel_max, break_thresh=break_thresh,
             grip_d_max=grip_d_max, normal_release=normal_release, inplane_keep=inplane_keep,
+            normal_gap=normal_gap,
             n_broken_outside=n_out, exist=bool(exist), select=bool(n_out == 0),
             nan=bool(torch.isnan(sim.x).any()), secs=round(time.time() - t0, 1),
         )

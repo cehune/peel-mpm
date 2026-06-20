@@ -56,17 +56,23 @@ say(f"PASS_0 {'PASS' if PASS_0 else 'FAIL'}  fd_pass={fd_pass}  "
     f"sanity={'ok' if sanity else 'BAD'}"
     + ("" if s is None else f" (broken_int={s['broken_int_frac']:.2f}, grip_d={s['grip_d_max']:.2f})"))
 
-# ---- PASS_D: directional STRESS isolation (the new, load-bearing block) ----
+# ---- PASS_D: directional STRESS -- kinematic outcome, not the circular ratio --
+# The constitutive release is now proved deterministically by Gate 3
+# (release_check). Block D's job is the SIM-LEVEL outcome: the split fires in the
+# full solver (inplane_keep on>>off -- a wiring smoke) AND the sheet actually
+# separates (a normal gap opens). inplane_keep alone is read off the split, so it
+# is NOT used as the sole discriminant.
 don = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0)
 dof = one(aniso="correct", directional="off", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0)
+def g(r, k, d=0.0): return (r.get(k) if r and r.get(k) is not None else d)
 PASS_D = bool(ok(don) and ok(dof)
-              and don["normal_release"] > 0.5
-              and don["inplane_keep"] > 0.5
-              and don["inplane_keep"] > 2.0 * max(dof["inplane_keep"], 1e-9))
+              and g(don, "inplane_keep") > 0.5
+              and g(don, "inplane_keep") > 2.0 * max(g(dof, "inplane_keep"), 1e-9)   # split fires
+              and g(don, "normal_gap") > 0.0)                                        # sheet separates
 say(f"PASS_D {'PASS' if PASS_D else 'FAIL'}  "
     + ("MISSING" if not (don and dof) else
-       f"on(release={don['normal_release']:.2f},keep={don['inplane_keep']:.2f}) "
-       f"off(keep={dof['inplane_keep']:.2f}) -> keep must be on>>off"))
+       f"on(keep={g(don,'inplane_keep'):.2f},gap={g(don,'normal_gap'):.4f},d_peel={g(don,'d_peel_max'):.2f}) "
+       f"off(keep={g(dof,'inplane_keep'):.2f},gap={g(dof,'normal_gap'):.4f},d_peel={g(dof,'d_peel_max'):.2f})"))
 
 # ---- PASS_1: driver mechanism (correct selects; iso doesn't; wrong no-exist)
 co = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0)
@@ -82,21 +88,24 @@ say(f"PASS_1 {'PASS' if PASS_1 else 'FAIL'}  "
        f"correct(route={co['routing']:.1f},sel={sel_correct}) "
        f"iso(route={iso['routing']:.1f}) wrong(phi_int={wr['phi_int_max']:.2f},brk={wr['broken_int_frac']:.2f})"))
 
-# ---- PASS_2: cos^2 direction signature ------------------------------------
-ang = sorted(find(aniso="correct", directional="on", rho=1, equal_E=True),
-             key=lambda r: r["pull_deg"])
-ang = [a for a in ang if a["pull_deg"] in (0, 30, 60, 80) and a.get("ngrid") == 64]
-PASS_2 = False
-if len(ang) >= 3 and all(not a.get("nan") for a in ang):
-    phis = [a["phi_int_max"] for a in ang]
-    mono = all(phis[i] >= phis[i + 1] - 0.15 * (phis[0] + 1e-9) for i in range(len(phis) - 1))
-    shear_ok = all((a["broken_int_frac"] < 0.05) or (a["phi_shear_max"] > 1)
-                   for a in ang if a["pull_deg"] >= 60)
-    PASS_2 = bool(mono and shear_ok)
-    say(f"PASS_2 {'PASS' if PASS_2 else 'FAIL'}  phi_int(theta)={['%.2f'%p for p in phis]} "
-        f"monotone={mono} high-angle-shear-explained={shear_ok}")
-else:
-    say("PASS_2 FAIL  MISSING angle sweep")
+# ---- PASS_2: within-run angular law  phi_int/phi_shear ~ cot^2(theta_n) -----
+# The initiation criterion's LHS. NOT phi_int~cos^2 (the driver squares the
+# normal traction -> phi_int~cos^4); the magnitude-free RATIO is the clean law.
+# One pull_deg=0 run spans all theta over the shell. correct -> log-log slope ~ +1;
+# wrong (shear driver) -> tracks sin^2 -> slope < 0; iso -> scatters (low R^2).
+co2 = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0)
+wr2 = one(aniso="wrong", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0)
+def _f(r, k):
+    v = r.get(k) if r else None
+    return v if isinstance(v, (int, float)) and v == v else None   # None if missing/NaN
+slope_c = _f(co2, "cos2_slope") if ok(co2) else None
+slope_w = _f(wr2, "cos2_slope") if ok(wr2) else None
+PASS_2 = bool(slope_c is not None and 0.6 < slope_c < 1.4
+              and (slope_w is None or slope_w < 0.5))   # correct ~1, wrong clearly lower
+say(f"PASS_2 {'PASS' if PASS_2 else 'FAIL'}  "
+    + ("MISSING cos2_slope" if slope_c is None else
+       f"cot^2 slope correct={slope_c:.2f} (want ~1, R2={_f(co2,'cos2_r2')}) "
+       f"wrong={slope_w} (want <0.5)"))
 
 # ---- PASS_3: toughness threshold rho* > 1 ---------------------------------
 rhos = sorted(find(aniso="correct", directional="on", pull_deg=0, equal_E=False),

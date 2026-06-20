@@ -33,7 +33,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 # The functions under test -- imported, not redefined, so the gate guards the
 # real solver code.  energy() and directional_pk1() use anisompm's module-level
 # gI/gII, the same pair the directional stress is built from.
-from anisompm import energy, directional_pk1, reconstruction_check, gI, gII   # noqa: E402
+from anisompm import (energy, directional_pk1, reconstruction_check,  # noqa: E402
+                      release_check, gI, gII)
 
 
 def fd_gradient(F, n0, d, params, eps):
@@ -91,7 +92,32 @@ def option_b_reconstruction(args):
     ok = err < tol
     print(f"   max|split(d=0) - corotated| = {err:.3e}")
     print(f"   -> {'PASS' if ok else 'FAIL'}  (tol {tol:.0e})")
+    print("   (NB: d=0 reconstruction is direction-BLIND -- a P<->Q swapped split")
+    print("    that keeps the normal and sheds the in-plane passes this identically.")
+    print("    Gate 3 is what tells a peel from its opposite.)")
     return ok, err
+
+
+def option_b_release(args):
+    """Gate 3: directional_kirchhoff RELEASES the normal + interfacial-shear
+    traction at d=1 while PRESERVING the in-plane stress -- the property that
+    defines a peel, and the one Gate 2 cannot see.  Run against the shipped
+    split, it PASSes the correct model and FAILs a P<->Q swap (proved in
+    validate_goal.py)."""
+    torch.manual_seed(args.seed + 2)
+    print("\nGate 3  (Option B):  releases normal+shear, keeps in-plane at d=1")
+    F = torch.eye(3).repeat(args.n, 1, 1) + 0.15 * torch.randn(args.n, 3, 3)
+    F = F[torch.linalg.det(F) > 0.2]
+    U, S, Vh = torch.linalg.svd(F)
+    R = U @ Vh
+    J = torch.linalg.det(F)
+    n0 = torch.randn(F.shape[0], 3)
+    n0 = n0 / n0.norm(dim=-1, keepdim=True)
+    ok, nk, ik, sk = release_check(F, R, J, n0, mu=10.0, lam=20.0, res=args.res, verbose=False)
+    print(f"   normal_kept={nk:.3f}  shear_kept={sk:.3f}  (want ~{args.res:g})  "
+          f"inplane_kept={ik:.3f}  (want ~1)")
+    print(f"   -> {'PASS' if ok else 'FAIL'}")
+    return ok, nk, ik, sk
 
 
 def main():
@@ -100,15 +126,20 @@ def main():
     ap.add_argument('--tol', type=float, default=1e-6, help='max relative error to pass Gate 1')
     ap.add_argument('--n', type=int, default=64, help='random samples')
     ap.add_argument('--eps', type=float, default=1e-6, help='FD step')
+    ap.add_argument('--res', type=float, default=1e-3,
+                    help='solver residual k_r to validate Gate 3 against '
+                         '(match your add_object residual)')
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--summary-json', default=None)
     args = ap.parse_args()
 
     okA, worstA = option_a_fd(args)
     okB, errB = option_b_reconstruction(args)
-    ok = okA and okB
+    okC, nk, ik, sk = option_b_release(args)
+    ok = okA and okB and okC
     print(f"\nFD CHECK {'PASS' if ok else 'FAIL'}  "
-          f"(A worst rel {worstA:.2e}; B recon {errB:.2e})")
+          f"(A worst rel {worstA:.2e}; B recon {errB:.2e}; "
+          f"C release n/s={nk:.3f}/{sk:.3f} keep={ik:.3f})")
 
     if args.summary_json:
         os.makedirs(os.path.dirname(args.summary_json) or '.', exist_ok=True)
@@ -117,6 +148,8 @@ def main():
                 "test": "fd_check", "t": time.time(),
                 "optionA_max_rel_err": worstA, "optionA_tol": args.tol, "optionA_pass": bool(okA),
                 "optionB_recon_err": errB, "optionB_pass": bool(okB),
+                "optionC_normal_kept": nk, "optionC_shear_kept": sk,
+                "optionC_inplane_kept": ik, "optionC_pass": bool(okC),
                 "pass": bool(ok),
             }) + "\n")
 

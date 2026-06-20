@@ -249,6 +249,61 @@ def reconstruction_check(F, R, J, n0, mu, lam, verbose=True):
     return err
 
 
+def release_check(F, R, J, n0, mu, lam, res=1e-3, tol=0.05, verbose=True):
+    """Option B GOAL check -- the one reconstruction_check is blind to.
+
+    At d=1 the normal AND interfacial-shear tractions must release to the
+    residual k_r while the in-plane stress is preserved: the skin lifts as a
+    coherent sheet.  reconstruction_check (d=0) passes even for a P<->Q swapped
+    split that KEEPS the normal and sheds the in-plane (the exact opposite of
+    delamination), because P+Q=I forces tau=tau_c at d=0 regardless of which
+    block is degraded.  This check is what fails that swap -- it is the first
+    test in the suite that can tell a peel from its opposite.
+
+    Tightenings folded in:
+      * asserts the SHEAR block too (mode II), not only normal + in-plane, so a
+        split that mis-routes only tau_shear cannot pass silently;
+      * `res` must match the solver's residual (self.residual) -- validate what
+        you ship, do not hardcode a different one;
+      * runs tension_gate=False on purpose.  By projector algebra the ratios are
+        exact (== res and == 1), so this is F-INDEPENDENT: one sample suffices,
+        and the batch + tol slack are belt-and-suspenders, not a flaky physics
+        test.  It is a WIRING assertion -- "degradation is routed to the
+        normal+shear components" -- and nothing more.  It does NOT exercise the
+        compressive tension-gate branch, nor any dynamics (crack advance, sheet
+        lift under a real pull); that soundness rests on the peel sweep / Kendall
+        strip.  A green release_check means "the split releases the right
+        component", not "the peel is validated".
+
+    Returns (ok, normal_kept, inplane_kept, shear_kept)."""
+    dev, dt = F.device, F.dtype
+    I3 = torch.eye(3, device=dev, dtype=dt).expand_as(F)
+    mu_ = mu.view(-1, 1, 1) if torch.is_tensor(mu) and mu.dim() == 1 else mu
+    lam_ = lam.view(-1) if torch.is_tensor(lam) and lam.dim() == 1 else lam
+    tau_c = 2.0 * mu_ * (F - R) @ F.transpose(1, 2) + (lam_ * (J - 1.0) * J).view(-1, 1, 1) * I3
+    g_dir = lambda dd: (1.0 - dd) ** 2 * (1.0 - res) + res
+    d1 = torch.ones(F.shape[0], device=dev, dtype=dt)
+    tau1 = directional_kirchhoff(tau_c, F, d1, n0, g_dir, g_dir, tension_gate=False)
+    m = torch.einsum('pij,pj->pi', F, n0)
+    m = m / (m.norm(dim=1, keepdim=True) + 1e-9)
+    Pm = torch.einsum('pi,pj->pij', m, m)
+    Qm = I3 - Pm
+    nrm = lambda t: t.reshape(F.shape[0], -1).norm(dim=1)
+    tnc = torch.einsum('pi,pij,pj->p', m, tau_c, m).abs()
+    tn1 = torch.einsum('pi,pij,pj->p', m, tau1, m).abs()
+    ipc = nrm(Qm @ tau_c @ Qm); ip1 = nrm(Qm @ tau1 @ Qm)
+    shc = nrm(Pm @ tau_c @ Qm + Qm @ tau_c @ Pm)
+    sh1 = nrm(Pm @ tau1 @ Qm + Qm @ tau1 @ Pm)
+    normal_kept = (tn1 / (tnc + 1e-9)).max().item()    # want ~ res (released)
+    inplane_kept = (ip1 / (ipc + 1e-9)).min().item()   # want ~ 1   (preserved)
+    shear_kept = (sh1 / (shc + 1e-9)).max().item()     # want ~ res (released)
+    ok = (normal_kept < res + tol) and (shear_kept < res + tol) and (inplane_kept > 1.0 - tol)
+    if verbose:
+        print(f"release_check: d=1 normal_kept={normal_kept:.3f} shear_kept={shear_kept:.3f} "
+              f"inplane_kept={inplane_kept:.3f} -> {'PASS' if ok else 'FAIL'}")
+    return ok, normal_kept, inplane_kept, shear_kept
+
+
 class AnisoMPM:
     def __init__(
         self,
@@ -331,6 +386,7 @@ class AnisoMPM:
         new["lam"] = torch.full((N,), lam, device=dev, dtype=dt)
         new["d"] = torch.zeros(N, device=dev, dtype=dt)
         new["lap"] = torch.zeros(N, device=dev, dtype=dt)
+        new["D_hist"] = torch.zeros(N, device=dev, dtype=dt)   # history-max driving (Eqn 11)
         # interface bookkeeping for the directional (delamination) stress.
         # Populated by set_normal_isolation(); all-False here means the
         # directional stress is a no-op (pure isotropic g(d) degradation).
@@ -379,7 +435,7 @@ class AnisoMPM:
             self.x = new["x"]; self.v = new["v"]; self.F = new["F"]; self.C = new["C"]
             self.vol0 = new["vol0"]; self.mass = new["mass"]
             self.mu = new["mu"]; self.lam = new["lam"]
-            self.d = new["d"]; self.lap = new["lap"]
+            self.d = new["d"]; self.lap = new["lap"]; self.D_hist = new["D_hist"]
             self.n_interface = new["n_interface"]; self.interface_mask = new["interface_mask"]
             self.a0 = new["a0"]; self.alpha = new["alpha"]
             self.A0 = new["A0"]
@@ -397,6 +453,7 @@ class AnisoMPM:
             self.vol0 = cat(self.vol0, new["vol0"]); self.mass = cat(self.mass, new["mass"])
             self.mu = cat(self.mu, new["mu"]); self.lam = cat(self.lam, new["lam"])
             self.d = cat(self.d, new["d"]); self.lap = cat(self.lap, new["lap"])
+            self.D_hist = cat(self.D_hist, new["D_hist"])
             self.n_interface = cat(self.n_interface, new["n_interface"])
             self.interface_mask = cat(self.interface_mask, new["interface_mask"])
             self.a0 = cat(self.a0, new["a0"]); self.alpha = cat(self.alpha, new["alpha"])
@@ -607,7 +664,13 @@ class AnisoMPM:
             tn_s = (Sn * self.n_interface).sum(1, keepdim=True)
             tt_s = (Sn - tn_s * self.n_interface).norm(dim=1)
             self.phi_shear = (tt_s / self.sigma_c) ** 2
-            dTilde = self.zeta * torch.relu(phi - 1.0)
+            # Eqn 11: the driving force is the HISTORY MAX of particle p,
+            #   D~_p = max(D~_H, zeta<Phi(sigma+)-1>),  not the instantaneous value.
+            # This enforces irreversibility of the DRIVE itself (Eqn 5: H = max_s D~).
+            # Under monotone loading the two coincide; they differ only on unloading,
+            # where the paper keeps driving at the historical peak.
+            self.D_hist = torch.maximum(self.D_hist, self.zeta * torch.relu(phi - 1.0))
+            dTilde = self.D_hist
             resist = self.d - (self.l0 ** 2) * self.lap
             ddot = torch.relu((1.0 - self.d) * dTilde - resist)
             dnew = self.d + (dt_dmg / self.eta) * ddot

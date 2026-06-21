@@ -107,6 +107,11 @@ def parse_args():
     ap.add_argument("--summary-json", default="", dest="summary_json",
                     help="append a one-line JSON result record to this path "
                          "(used by sweep_peel.py)")
+    ap.add_argument("--skip-if-done", action="store_true", dest="skip_if_done",
+                    help="resume support: if a FINITE record with this exact config "
+                         "already exists in --summary-json, skip the run. Makes the "
+                         "gate idempotent / restartable after SLURM preemption "
+                         "(re-run the same command; finished cells are skipped).")
     return ap.parse_args()
 
 
@@ -145,6 +150,34 @@ def save_slice(sim, masks, center, spacing, path):
 
 def main():
     args = parse_args()
+
+    # ---- resume support: skip this cell if it already finished (finite) -------
+    if args.skip_if_done and args.summary_json and os.path.exists(args.summary_json):
+        key = dict(aniso=args.aniso, directional=args.directional, rho=args.rho,
+                   pull_deg=args.pull_deg, equal_E=bool(args.equal_E), ngrid=args.ngrid,
+                   ppcd=args.ppcd, seed=args.seed, sigc_frac=args.sigc_frac, speed=args.speed)
+
+        def _eq(a, b):
+            if isinstance(b, bool):
+                return a is not None and bool(a) == b
+            if isinstance(b, (int, float)):
+                return a is not None and abs(float(a) - float(b)) < 1e-9
+            return a == b
+        import json as _json
+        for _line in open(args.summary_json):
+            _line = _line.strip()
+            if not _line:
+                continue
+            try:
+                _r = _json.loads(_line)
+            except Exception:
+                continue
+            if _r.get("test") == "fd_check":
+                continue
+            if (not _r.get("nan", True)) and all(_eq(_r.get(k), v) for k, v in key.items()):
+                print(f"[peel] skip (already done, finite): {key}")
+                return
+
     dev = pick_device(args.device)
     print(f"[peel] device={dev}")
     c = np.array([0.5, 0.5, 0.5]) * GRID_LIM
@@ -258,6 +291,19 @@ def main():
     phi_shear_peak = torch.zeros((), device=dev, dtype=sim.dtype)  # interface mode-II drive
     phi_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)  # per-particle phi peak (Block 2)
     psh_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)  # per-particle phi_shear peak
+    # halo-aware bystander-break threshold (ppcd-invariant; see verdict note),
+    # computed before the loop so the onset snapshot can use it.
+    halo_pred = math.exp(-spacing / l0)
+    break_thresh = max(0.5, halo_pred + 0.25)                # 0.62 @ ppcd2, 0.70 @ ppcd2.5
+    # Grade the DELAMINATION EVENT, not the over-pulled tail.  d is irreversible,
+    # so bystander damage only grows -> the final frame is the WORST selectivity
+    # and routing (phi_int/phi_bystander) inverts once the bystanders catch up.
+    # So: track peak routing, and snapshot the whole state at the first frame the
+    # interface delaminates (>5% broken).  Selectivity/routing/cos2/release are
+    # read at that snapshot; EXISTENCE uses the achieved (monotone) maximum.
+    peak_routing = torch.zeros((), device=dev, dtype=sim.dtype)
+    onset_reached = False; onset_frame = -1
+    d_snap = phipp_snap = pshpp_snap = tau_snap = J_snap = x_snap = None
     for f in range(args.frames):
         sim.run_frame(n_sub, f / args.fps)
         # running phi maxima accumulate on-device -- no host sync per frame
@@ -266,10 +312,20 @@ def main():
             phf = torch.stack([ph[interface].max(), ph[flesh].max(), ph[peel].max()])
             phi_peak = torch.maximum(phi_peak, phf)
             phi_pp = torch.maximum(phi_pp, ph)
+            peak_routing = torch.maximum(peak_routing, phf[0] / (torch.maximum(phf[1], phf[2]) + 1e-9))
         psh = getattr(sim, "phi_shear", None)
         if psh is not None:
             phi_shear_peak = torch.maximum(phi_shear_peak, psh[interface].max())
             psh_pp = torch.maximum(psh_pp, psh)
+        if not onset_reached and float((sim.d[interface] > 0.5).float().mean()) > 0.05:
+            onset_reached = True; onset_frame = f                # delamination onset
+            d_snap = sim.d.clone(); phipp_snap = phi_pp.clone(); pshpp_snap = psh_pp.clone()
+            tl = getattr(sim, "tau_last", None); Jl = getattr(sim, "J_last", None)
+            tau_snap = None if tl is None else tl.clone()
+            J_snap = None if Jl is None else Jl.clone()
+            x_snap = sim.x.clone()
+            if args.plot_every:                                  # the clean 'money shot'
+                save_slice(sim, masks, c, spacing, os.path.join(run_dir, f"slice_ONSET_f{f:03d}.png"))
 
         if (f % args.log_every == 0) or (f == args.frames - 1):
             di, dfl, dpe = sim.d[interface], sim.d[flesh], sim.d[peel]
@@ -301,26 +357,30 @@ def main():
     # equilibrate at d ~ exp(-spacing/l0) by the Laplacian term alone. That
     # halo is the method working, not leakage. Failure means a bystander
     # actually BREAKS (d > 0.5), so that's what we test.
-    broken_int_frac = float((sim.d[interface] > 0.5).float().mean())
-    exist = broken_int_frac > 0.05
-    # halo-aware bystander-break threshold.  The diffuse Laplacian halo is
-    # halo_pred = exp(-spacing/l0) = exp(-2/ppcd) -- it depends on ppcd, NOT ngrid,
-    # and RISES with ppcd (0.37 @ ppcd2, 0.45 @ ppcd2.5).  A flat 0.5 threshold
-    # false-FAILs selectivity at high ppcd -- the exact numerical artifact Block 4
-    # exists to rule out, induced by the metric.  Tie the threshold to the halo so
-    # the margin (and the verdict) is ppcd-invariant.
-    halo_pred = math.exp(-spacing / l0)
-    break_thresh = max(0.5, halo_pred + 0.25)               # 0.62 @ ppcd2, 0.70 @ ppcd2.5
-    n_out = int((sim.d[flesh] > break_thresh).sum()) + int((sim.d[peel] > break_thresh).sum())
-    d_bystander_max = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))
+    # evaluation state: the over-pull-sensitive metrics (selectivity, cos2,
+    # release, gap, grip) are read at the DELAMINATION-ONSET snapshot, not the
+    # over-pulled final frame.  EXISTENCE uses the achieved (monotone) maximum.
+    if onset_reached:
+        d_e, phipp_e, pshpp_e, x_e, tau_e, J_e = d_snap, phipp_snap, pshpp_snap, x_snap, tau_snap, J_snap
+    else:                                                    # never delaminated -> final state
+        d_e, phipp_e, pshpp_e, x_e = sim.d, phi_pp, psh_pp, sim.x
+        tau_e = getattr(sim, "tau_last", None); J_e = getattr(sim, "J_last", None)
+    broken_int_frac = float((sim.d[interface] > 0.5).float().mean())   # achieved max (monotone)
+    exist = bool(onset_reached) or broken_int_frac > 0.05
+    # halo-aware bystander-break threshold (break_thresh/halo_pred set before the
+    # loop).  Bystander damage is read at ONSET: d is irreversible, so the final
+    # frame is the worst-case selectivity once over-pull damages everything.
+    n_out = int((d_e[flesh] > break_thresh).sum()) + int((d_e[peel] > break_thresh).sum())
+    d_bystander_max = max(float(d_e[flesh].max()), float(d_e[peel].max()))         # at onset
+    d_bystander_final = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))   # over-pull tail
 
-    # routing: interface drive vs the toughest bystander drive.  With contrast and
-    # geometry stripped (Block 1: rho=1, --equal-E) this isolates the structural
-    # tensor's selectivity.  Use the RATIO; iso need not be ~1 (pole geometry
-    # concentrates stress regardless), but correct should route >> iso.
-    pk = phi_peak.cpu().tolist()                              # [int, flesh, peel]
+    # routing: interface drive vs the toughest bystander drive, taken at its PEAK
+    # over the run (non-monotone: high while the interface leads, then inverts once
+    # the over-pulled bystanders catch up).  With contrast and geometry stripped
+    # (Block 1: rho=1, --equal-E) this isolates the structural tensor's selectivity.
+    pk = phi_peak.cpu().tolist()                              # [int, flesh, peel] running max
     phi_bystander_max = max(pk[1], pk[2])
-    routing = pk[0] / (phi_bystander_max + 1e-9)
+    routing = float(peak_routing)
 
     # --- Block 2: angular law via the magnitude-free ratio ---------------------
     # The initiation criterion is phi_int/phi_shear ~ cot^2(theta_n).  IMPORTANT:
@@ -331,13 +391,13 @@ def main():
     # the whole law.  log-log slope -> +1 for 'correct' (normal driver), < 0 for
     # 'wrong' (shear driver tracks sin^2), and scatters (low R^2) for 'iso'.
     cth = (r_hat @ pull_dir).clamp(-1.0, 1.0)                 # cos(theta_n) per particle
-    loaded = interface & (cth > 0) & (phi_pp > 1e-6) & (psh_pp > 1e-9)
+    loaded = interface & (cth > 0) & (phipp_e > 1e-6) & (pshpp_e > 1e-9)
     cos2_slope = float("nan"); cos2_r2 = float("nan"); cos2_n = int(loaded.sum())
     if cos2_n > 8:
         cos2 = cth[loaded] ** 2
         sin2 = (1.0 - cos2).clamp(min=1e-6)
         ratio_pred = cos2 / sin2                              # cot^2(theta_n)
-        ratio_obs = phi_pp[loaded] / (psh_pp[loaded] + 1e-12)
+        ratio_obs = phipp_e[loaded] / (pshpp_e[loaded] + 1e-12)
         m2 = (ratio_obs > 1e-6) & (ratio_pred > 1e-3) & (ratio_pred < 1e3)
         if int(m2.sum()) > 8:
             X = torch.log(ratio_pred[m2]); Y = torch.log(ratio_obs[m2])
@@ -350,7 +410,7 @@ def main():
     # frozen by allow=False): max damage in the ALLOWED peel ring just below the
     # pulled cap.  High here = the pull is tearing at the grip, not delaminating.
     ring = peel & (~cap) & (cos_up > math.cos(math.radians(args.cap_deg + 15)))
-    grip_d_max = float(sim.d[ring].max()) if int(ring.sum()) > 0 else 0.0
+    grip_d_max = float(d_e[ring].max()) if int(ring.sum()) > 0 else 0.0
 
     # directional-stress observable: at damaged interface particles the normal
     # traction should collapse (normal_release -> 1) while the in-plane stress is
@@ -358,17 +418,16 @@ def main():
     # tension, but inplane_keep -> 0 there -- so inplane_keep is the discriminant
     # that the directional split (not just damage) is doing the work.
     normal_release = inplane_keep = float("nan")
-    tau_last = getattr(sim, "tau_last", None)
-    if tau_last is not None and int(interface.sum()) > 0:
-        sig = tau_last / sim.J_last.view(-1, 1, 1)            # degraded Cauchy stress
+    if tau_e is not None and J_e is not None and int(interface.sum()) > 0:
+        sig = tau_e / J_e.view(-1, 1, 1)                      # degraded Cauchy stress (at onset)
         nrm = r_hat
         Sn = torch.einsum('pij,pj->pi', sig, nrm)
         tn = (Sn * nrm).sum(1).abs()                          # |normal traction|
         Pn = nrm.unsqueeze(2) * nrm.unsqueeze(1)
         Qn = I3 - Pn
         sip = (Qn @ sig @ Qn).reshape(sim.n, -1).norm(dim=1)  # in-plane stress mag
-        intact = interface & (sim.d < 0.1)
-        broken = interface & (sim.d > 0.5)
+        intact = interface & (d_e < 0.1)
+        broken = interface & (d_e > 0.5)
         if int(intact.sum()) > 0 and int(broken.sum()) > 0:
             normal_release = 1.0 - float(tn[broken].mean() / (tn[intact].mean() + 1e-9))
             inplane_keep = float(sip[broken].mean() / (sip[intact].mean() + 1e-9))
@@ -381,7 +440,7 @@ def main():
     # interface mushed, so the gap doesn't cleanly open and the peel itself damages.
     # gap = increase in distance from each interface particle to nearest flesh.
     normal_gap = float("nan")
-    d_peel_max = float(sim.d[peel].max()) if int(peel.sum()) > 0 else float("nan")
+    d_peel_max = float(d_e[peel].max()) if int(peel.sum()) > 0 else float("nan")
     if int(interface.sum()) > 0 and int(flesh.sum()) > 0:
         fi = torch.nonzero(interface, as_tuple=False).squeeze(1)
         ff = torch.nonzero(flesh, as_tuple=False).squeeze(1)
@@ -393,16 +452,16 @@ def main():
             for i in range(0, Xq.shape[0], chunk):
                 out[i:i + chunk] = torch.cdist(Xq[i:i + chunk], Xref).min(dim=1).values
             return out
-        gap = (_nn(sim.x[fi], sim.x[ff]) - _nn(x0[fi], x0[ff])).clamp(min=0.0)
-        br_i = sim.d[fi] > 0.5
+        gap = (_nn(x_e[fi], x_e[ff]) - _nn(x0[fi], x0[ff])).clamp(min=0.0)
+        br_i = d_e[fi] > 0.5
         normal_gap = float(gap[br_i].mean()) if int(br_i.sum()) > 0 else 0.0
 
     print(f"\n[peel] aniso={args.aniso} directional={args.directional} "
           f"equal_E={args.equal_E} seed={args.seed}")
     print(f"[peel] EXISTENCE (>5% interface broken): {'PASS' if exist else 'FAIL'}  "
-          f"(broken_int_frac={broken_int_frac:.3f})")
-    print(f"[peel] SELECTIVITY (no bystander breaks): {'PASS' if n_out == 0 else 'FAIL'}  "
-          f"(broken_outside={n_out}, d_bystander_max={d_bystander_max:.2f}, "
+          f"(broken_int_frac={broken_int_frac:.3f}, delam onset frame={onset_frame})")
+    print(f"[peel] SELECTIVITY (no bystander breaks @ onset): {'PASS' if n_out == 0 else 'FAIL'}  "
+          f"(broken_outside={n_out}, d_bystander @onset={d_bystander_max:.2f} @final={d_bystander_final:.2f}, "
           f"thresh={break_thresh:.2f}, halo~{halo_pred:.2f})")
     print(f"[peel] routing phi_int/phi_bystander={routing:.2f}  "
           f"(phi_int={pk[0]:.2f} phi_bystander={phi_bystander_max:.2f} phi_shear={float(phi_shear_peak):.2f})")
@@ -421,9 +480,10 @@ def main():
             speed=args.speed, ngrid=args.ngrid, ppcd=args.ppcd, frames=args.frames,
             phi_int_max=pk[0], phi_bystander_max=phi_bystander_max,
             phi_flesh_max=pk[1], phi_peel_max=pk[2], phi_shear_max=float(phi_shear_peak),
-            routing=routing, broken_int_frac=broken_int_frac,
+            routing=routing, broken_int_frac=broken_int_frac, onset_frame=onset_frame,
             cos2_slope=cos2_slope, cos2_r2=cos2_r2, cos2_n=cos2_n,
             d_int_max=float(sim.d[interface].max()), d_bystander_max=d_bystander_max,
+            d_bystander_final=d_bystander_final,
             d_peel_max=d_peel_max, break_thresh=break_thresh,
             grip_d_max=grip_d_max, normal_release=normal_release, inplane_keep=inplane_keep,
             normal_gap=normal_gap,

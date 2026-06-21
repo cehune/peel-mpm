@@ -45,58 +45,54 @@ from __future__ import annotations
 import math
 import torch
 
-def sym_eig(A: torch.Tensor):
-    """Analytic eigendecomposition of a batch of symmetric 3x3 matrices.
+def sym_eig(A: torch.Tensor, sweeps: int = 5):
+    """Eigendecomposition of a batch of symmetric 3x3 matrices via batched cyclic
+    Jacobi rotations.  Returns (evals ascending, evecs as columns).
 
-    Closed form (Cardano for the eigenvalues, null-space products + a cross
-    product for the eigenvectors).  No LAPACK / cuSOLVER / SVD, so it runs
-    natively on every backend including Apple MPS (where torch.linalg.svd is
-    unimplemented and silently falls back to CPU -- a host<->device copy every
-    substep).  It is also correct on indefinite/degenerate stress, unlike the
-    old SVD sign-recovery trick which mis-signed balanced shear (eigs +/-s with
-    equal singular values).  Returns (evals ascending, evecs as columns)."""
-    a00 = A[:, 0, 0]; a11 = A[:, 1, 1]; a22 = A[:, 2, 2]
-    a01 = A[:, 0, 1]; a02 = A[:, 0, 2]; a12 = A[:, 1, 2]
-    q = (a00 + a11 + a22) / 3.0
-    p1 = a01 * a01 + a02 * a02 + a12 * a12
-    p2 = (a00 - q) ** 2 + (a11 - q) ** 2 + (a22 - q) ** 2 + 2.0 * p1
-    p = torch.sqrt(torch.clamp(p2 / 6.0, min=1e-30))
-    iso = (p2 < 1e-18)                                       # A ~ q I (degenerate)
-    bp = 1.0 / p
-    b00 = (a00 - q) * bp; b11 = (a11 - q) * bp; b22 = (a22 - q) * bp
-    b01 = a01 * bp; b02 = a02 * bp; b12 = a12 * bp
-    detB = (b00 * (b11 * b22 - b12 * b12)
-            - b01 * (b01 * b22 - b12 * b02)
-            + b02 * (b01 * b12 - b11 * b02))
-    r = torch.clamp(0.5 * detB, -1.0, 1.0)
-    phi = torch.acos(r) / 3.0
-    TWO_PI_3 = 2.0943951023931953                            # 2*pi/3
-    e1 = q + 2.0 * p * torch.cos(phi)                        # largest
-    e3 = q + 2.0 * p * torch.cos(phi + TWO_PI_3)             # smallest
-    e2 = 3.0 * q - e1 - e3
-    I3 = torch.eye(3, device=A.device, dtype=A.dtype).expand_as(A)
-
-    def _vec(li, lj):                                        # eigvec of the third eval
-        M = (A - li.view(-1, 1, 1) * I3) @ (A - lj.view(-1, 1, 1) * I3)
-        nrm = M.norm(dim=1)                                  # per-column norms (N,3)
-        k = nrm.argmax(dim=1)                                # most reliable column
-        v = torch.gather(M, 2, k.view(-1, 1, 1).expand(-1, 3, 1))[:, :, 0]
-        return v / (v.norm(dim=1, keepdim=True) + 1e-30)
-
-    v1 = _vec(e2, e3)                                        # eigvec for e1
-    v3 = _vec(e1, e2)                                        # eigvec for e3
-    v2 = torch.cross(v3, v1, dim=1)
-    v2 = v2 / (v2.norm(dim=1, keepdim=True) + 1e-30)
-    v3 = torch.cross(v1, v2, dim=1)                          # re-orthonormalise
-    if iso.any():                                            # fall back to I basis
-        im = iso.view(-1, 1)
-        ex = torch.tensor([1.0, 0, 0], device=A.device, dtype=A.dtype)
-        ey = torch.tensor([0, 1.0, 0], device=A.device, dtype=A.dtype)
-        ez = torch.tensor([0, 0, 1.0], device=A.device, dtype=A.dtype)
-        v1 = torch.where(im, ex, v1); v2 = torch.where(im, ey, v2); v3 = torch.where(im, ez, v3)
-    evals = torch.stack([e3, e2, e1], dim=1)                 # ascending
-    Q = torch.stack([v3, v2, v1], dim=2)                     # columns match evals
-    return evals, Q
+    Why Jacobi and not torch.linalg.eigh OR the old analytic Cardano path:
+      * torch.linalg.eigh on CUDA routes a large batch of 3x3 through
+        cusolverDnXsyevBatched, which throws CUSOLVER_STATUS_INVALID_VALUE on
+        some CUDA/cusolver versions -- even for a batch of plain identities (and
+        every substep starts at F=I, so C=I).  Unusable here.
+      * the old analytic Cardano + null-product eigenVECTORS were catastrophically
+        wrong for (near-)degenerate eigenvalues in float32: a near-identity C
+        (ubiquitous in any nearly-rigid region) gave |V| ~ 1e5, a polar R with
+        |R^T R - I| ~ 1e10, and corotated stress ~1e23 -- the real 'ball NaN'.
+    Jacobi is pure elementwise/matmul (no cusolver / LAPACK / MAGMA / SVD),
+    identical on CPU/CUDA/MPS, and robust to degeneracy: a degenerate 2x2 block is
+    just rotated 45 deg and any orthonormal pair spanning it is a valid eigenbasis.
+    cyclic Jacobi converges quadratically for 3x3 -- 4 sweeps already hit the
+    float32 floor (recon/ortho/eval_err ~1e-6; ~1e-15 in float64), so 5 is plenty
+    and is ~2.4x cheaper than the 12 it took before.  nan_to_num keeps a
+    diverged cell finite so peel_test's nan check aborts it gracefully instead of
+    crashing."""
+    A = torch.nan_to_num(0.5 * (A + A.transpose(1, 2)))         # symmetrize + sanitize
+    N = A.shape[0]
+    Am = A.clone()
+    V = torch.eye(3, device=A.device, dtype=A.dtype).expand(N, 3, 3).contiguous()
+    for _ in range(sweeps):
+        for (p, q) in ((0, 1), (0, 2), (1, 2)):
+            r = 3 - p - q
+            app = Am[:, p, p].clone(); aqq = Am[:, q, q].clone(); apq = Am[:, p, q].clone()
+            apr = Am[:, p, r].clone(); aqr = Am[:, q, r].clone()
+            zeta = (aqq - app) / (2.0 * apq)
+            sgn = torch.where(zeta >= 0, torch.ones_like(zeta), -torch.ones_like(zeta))  # sign(0)->+1
+            t = sgn / (zeta.abs() + torch.sqrt(1.0 + zeta * zeta))
+            t = torch.where(apq.abs() > 1e-30, t, torch.zeros_like(t))      # skip if already 0
+            c = 1.0 / torch.sqrt(1.0 + t * t); s = c * t
+            Am[:, p, p] = c * c * app - 2.0 * s * c * apq + s * s * aqq
+            Am[:, q, q] = s * s * app + 2.0 * s * c * apq + c * c * aqq
+            Am[:, p, q] = 0.0; Am[:, q, p] = 0.0
+            npr = c * apr - s * aqr; nqr = s * apr + c * aqr
+            Am[:, p, r] = npr; Am[:, r, p] = npr
+            Am[:, q, r] = nqr; Am[:, r, q] = nqr
+            vp = V[:, :, p].clone(); vq = V[:, :, q].clone()
+            V[:, :, p] = c.unsqueeze(1) * vp - s.unsqueeze(1) * vq
+            V[:, :, q] = s.unsqueeze(1) * vp + c.unsqueeze(1) * vq
+    evals = torch.diagonal(Am, dim1=1, dim2=2)
+    evals, idx = torch.sort(evals, dim=1)                       # ascending
+    V = torch.gather(V, 2, idx.unsqueeze(1).expand(-1, 3, -1))  # columns match evals
+    return evals, V
 
 
 # quadratic B-spline 2nd-derivative stencil (wrt the local fx coordinate)
@@ -624,9 +620,20 @@ class AnisoMPM:
         What = W / (W.norm(dim=1, keepdim=True) + 1e-12)      # orthonormalise columns
         R = What @ Vt                                         # exactly orthogonal polar rotation
         if self.f_clamp is not None:                          # strain-limit (stability)
-            S = S.clamp(self.f_clamp[0], self.f_clamp[1])
-            F = R @ (V @ torch.diag_embed(S) @ Vt)            # clamp stretch only (R untouched)
+            # Rebuild F via a MATERIAL-FRAME correction, not R@(V Sc Vt).  The
+            # analytic polar R is only ~1e-2 accurate in float32, and the old
+            # R-based rebuild amplified that into NaNs (the f_clamp blow-up).
+            #   F_c = F (V diag(Sc/S) V^T)
+            # uses only V -- whose ORTHONORMALITY is ~1e-7 (good), unlike R's
+            # orthogonality (~1e-2) -- and is EXACTLY F wherever nothing is
+            # clamped (Sc=S => V I V^T = I).  No SVD, so it stays MPS-safe.  R
+            # (used for the stress) is unchanged by a stretch clamp, so it is
+            # still the correct rotation for the clamped F.
+            Sc = S.clamp(self.f_clamp[0], self.f_clamp[1])
+            corr = V @ torch.diag_embed(Sc / S.clamp(min=1e-12)) @ Vt
+            F = F @ corr
             self.F = F
+            S = Sc
         J = (S[:, 0] * S[:, 1] * S[:, 2]).clamp(min=1e-6)
         mu = self.mu.view(-1, 1, 1)
         lam = self.lam.view(-1, 1, 1)

@@ -116,7 +116,7 @@ def derive(snap):
         aniso=cfg["aniso"], directional=cfg["directional"], equal_E=bool(cfg["equal_E"]),
         seed=cfg["seed"], rho=cfg["rho"], pull_deg=cfg["pull_deg"], sigc_frac=cfg["sigc_frac"],
         speed=cfg["speed"], ngrid=cfg["ngrid"], ppcd=cfg["ppcd"], frames=cfg["frames"],
-        notch_deg=cfg.get("notch_deg", 0.0),
+        notch_deg=cfg.get("notch_deg", 0.0), grip=cfg.get("grip", "cap"),
         phi_int_max=pk[0], phi_bystander_max=phi_bystander_max,
         phi_flesh_max=pk[1], phi_peel_max=pk[2], phi_shear_max=phi_shear_peak,
         routing=routing, broken_int_frac=broken_int_frac, onset_frame=onset_frame,

@@ -74,10 +74,14 @@ def say(s): lines.append(s)
 solver_shas = sorted({r.get("solver_sha", "?") for r in peel})
 setup_shas = sorted({r.get("setup_sha", "?") for r in peel})
 notch_vals = sorted({round(float(r.get("notch_deg", 0.0)), 6) for r in peel})
-# the loading protocol the matchers below pin to (the dominant notch in the dir)
+grip_vals = sorted({str(r.get("grip", "cap")) for r in peel})
+# the loading protocol the matchers below pin to (the dominant notch/grip in the dir)
 NOTCH = (max(notch_vals, key=lambda v: sum(1 for r in peel
              if round(float(r.get("notch_deg", 0.0)), 6) == v)) if peel else 0.0)
-drift = len(solver_shas) > 1 or len(setup_shas) > 1 or len(notch_vals) > 1
+GRIP = (max(grip_vals, key=lambda v: sum(1 for r in peel
+            if str(r.get("grip", "cap")) == v)) if peel else "cap")
+drift = (len(solver_shas) > 1 or len(setup_shas) > 1
+         or len(notch_vals) > 1 or len(grip_vals) > 1)
 if drift:
     say("DRIFT  !!  results span multiple revisions -- verdict is NOT trustworthy:")
     if len(solver_shas) > 1:
@@ -86,9 +90,11 @@ if drift:
         say(f"          setup_sha  = {setup_shas}  (mixed harness)")
     if len(notch_vals) > 1:
         say(f"          notch_deg  = {notch_vals}  (mixed loading protocol -- clear out/ and re-run)")
+    if len(grip_vals) > 1:
+        say(f"          grip       = {grip_vals}  (mixed loading protocol -- clear out/ and re-run)")
 else:
     say(f"src OK  solver_sha={solver_shas[0] if solver_shas else '?'} "
-        f"setup_sha={setup_shas[0] if setup_shas else '?'}  notch_deg={NOTCH:g}  "
+        f"setup_sha={setup_shas[0] if setup_shas else '?'}  notch_deg={NOTCH:g} grip={GRIP}  "
         f"({len(peel)} configs)")
 
 # ---- PASS_0: math gate + maximally-helped sanity --------------------------
@@ -101,8 +107,8 @@ say(f"PASS_0 {'PASS' if PASS_0 else 'FAIL'}  fd_pass={fd_pass}  "
     + ("" if s is None else f" (broken_int={s['broken_int_frac']:.2f}, grip_d={s['grip_d_max']:.2f})"))
 
 # ---- PASS_D: directional STRESS -- kinematic outcome, not the circular ratio --
-don = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
-dof = one(aniso="correct", directional="off", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
+don = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
+dof = one(aniso="correct", directional="off", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
 def g(r, k, d=0.0): return (r.get(k) if r and r.get(k) is not None else d)
 PASS_D = bool(ok(don) and ok(dof)
               and g(don, "inplane_keep") > 0.5
@@ -114,9 +120,9 @@ say(f"PASS_D {'PASS' if PASS_D else 'FAIL'}  "
        f"off(keep={g(dof,'inplane_keep'):.2f},gap={g(dof,'normal_gap'):.4f},d_peel={g(dof,'d_peel_max'):.2f})"))
 
 # ---- PASS_1: driver mechanism (correct selects; iso doesn't; wrong no-exist)
-co = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
-iso = one(aniso="iso", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
-wr = one(aniso="wrong", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
+co = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
+iso = one(aniso="iso", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
+wr = one(aniso="wrong", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
 sel_correct = ok(co) and co["routing"] > 2 and co["phi_int_max"] > 1 \
     and co["d_bystander_max"] < 0.5 and co["grip_d_max"] < 0.1
 iso_no_sel = ok(iso) and (co and co["routing"] > 3 * iso["routing"] or (iso and iso["d_bystander_max"] > 0.5))
@@ -128,8 +134,8 @@ say(f"PASS_1 {'PASS' if PASS_1 else 'FAIL'}  "
        f"iso(route={iso['routing']:.1f}) wrong(phi_int={wr['phi_int_max']:.2f},brk={wr['broken_int_frac']:.2f})"))
 
 # ---- PASS_2: within-run angular law  phi_int/phi_shear ~ cot^2(theta_n) -----
-co2 = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
-wr2 = one(aniso="wrong", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
+co2 = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
+wr2 = one(aniso="wrong", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
 def _f(r, k):
     v = r.get(k) if r else None
     return v if isinstance(v, (int, float)) and v == v else None   # None if missing/NaN
@@ -143,7 +149,7 @@ say(f"PASS_2 {'PASS' if PASS_2 else 'FAIL'}  "
        f"wrong={slope_w} (want <0.5)"))
 
 # ---- PASS_3: toughness threshold rho* > 1 ---------------------------------
-rhos = sorted(find(aniso="correct", directional="on", pull_deg=0, equal_E=False, notch_deg=NOTCH),
+rhos = sorted(find(aniso="correct", directional="on", pull_deg=0, equal_E=False, notch_deg=NOTCH, grip=GRIP),
               key=lambda r: r["rho"])
 rho_star = None
 for r in rhos:
@@ -154,9 +160,9 @@ say(f"PASS_3 {'PASS' if PASS_3 else 'FAIL'}  rho*={rho_star} (need > 1)  "
     f"tested={[r['rho'] for r in rhos]}")
 
 # ---- PASS_4: numerical invariance -----------------------------------------
-base = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH)
-fineg = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=96, ppcd=2.0, notch_deg=NOTCH)
-finep = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.5, notch_deg=NOTCH)
+base = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
+fineg = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=96, ppcd=2.0, notch_deg=NOTCH, grip=GRIP)
+finep = one(aniso="correct", directional="on", rho=1, pull_deg=0, equal_E=True, ngrid=64, ppcd=2.5, notch_deg=NOTCH, grip=GRIP)
 def verdict(r): return (bool(r["exist"]), bool(r["select"])) if ok(r) else None
 vs = [verdict(base), verdict(fineg), verdict(finep)]
 PASS_4 = bool(all(v is not None for v in vs) and vs[0] == vs[1] == vs[2])

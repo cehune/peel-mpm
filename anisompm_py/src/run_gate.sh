@@ -39,6 +39,7 @@
 #   DEV=cuda:0 bash src/run_gate.sh              # your NVIDIA box (recommended)
 #   RESUME=0 DEV=cuda:0 bash src/run_gate.sh     # clean slate (wipe out/sims+results)
 #   NOTCH=8 RESUME=0 DEV=cuda:0 bash src/run_gate.sh   # pole-seeded loading protocol
+#   GRIP=spread RESUME=0 DEV=cuda:0 bash src/run_gate.sh  # distributed peel load (anti-cap-stress)
 #   bash src/run_gate.sh                          # auto: cuda -> mps -> cpu
 # Caching: with RESUME=1 (default) finished cells are served from cache; after a
 #   solver change they re-run automatically (snapshot solver-hash mismatch).  So
@@ -63,12 +64,14 @@ DT=${DT:-3e-4}                                   # timestep;   LOWER = more stab
 RAMP=${RAMP:-0.30}                               # pull ramp time; LONGER = gentler start
 PLOT=${PLOT:-0}                                  # >0: save a cross-section PNG every N frames
 NOTCH=${NOTCH:-0}                                # >0: pole pre-crack (degrees); loading protocol
+GRIP=${GRIP:-cap}                                # cap | spread (spread = pull whole peel layer:
+                                                 #   distributed mode-I load, no cap-edge stress)
 SIMS=out/sims                                    # cached snapshots  (<tag>.pt)
 RES_DIR=out/results                              # per-config observables (<tag>.json)
 FD_LOG=out/fd_check.jsonl                        # math-gate record (read by verdict)
 S=src/peel_test.py
 C="--device $DEV --ngrid $NG --frames $FRAMES --speed $SPEED --dt $DT --ramp $RAMP \
-   --plot-every $PLOT --notch-deg $NOTCH --sims-dir $SIMS --results-dir $RES_DIR"
+   --plot-every $PLOT --notch-deg $NOTCH --grip $GRIP --sims-dir $SIMS --results-dir $RES_DIR"
 mkdir -p out "$SIMS" "$RES_DIR"
 if [ "$RESUME" = "0" ]; then
   rm -f "$SIMS"/*.pt "$RES_DIR"/*.json "$FD_LOG" 2>/dev/null || true

@@ -58,8 +58,8 @@ def config_dict(args):
     return dict(aniso=args.aniso, directional=args.directional, rho=float(args.rho),
                 pull_deg=float(args.pull_deg), equal_E=bool(args.equal_E), ngrid=int(args.ngrid),
                 ppcd=float(args.ppcd), seed=int(args.seed), sigc_frac=float(args.sigc_frac),
-                speed=float(args.speed), notch_deg=float(args.notch_deg), R=float(args.R),
-                dt=float(args.dt), ramp=float(args.ramp), eta=float(args.eta),
+                speed=float(args.speed), notch_deg=float(args.notch_deg), grip=str(args.grip),
+                R=float(args.R), dt=float(args.dt), ramp=float(args.ramp), eta=float(args.eta),
                 E_flesh=Ef, E_int=Ei, E_peel=Ep, f_clamp=str(args.f_clamp),
                 frames=int(args.frames), fps=int(args.fps), damage_every=int(args.damage_every))
 
@@ -70,7 +70,7 @@ def config_tag(args):
     cid = hashlib.sha1(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:6]
     core = (f"a{args.aniso}_dir{args.directional}_rho{args.rho:g}_pull{args.pull_deg:g}"
             f"_eq{int(bool(args.equal_E))}_ng{args.ngrid}_ppcd{args.ppcd:g}"
-            f"_seed{args.seed}_notch{args.notch_deg:g}")
+            f"_seed{args.seed}_notch{args.notch_deg:g}_grip{args.grip}")
     return f"{core}__{cid}"
 
 
@@ -95,6 +95,10 @@ def parse_args():
     ap.add_argument("--speed", type=float, default=0.12)
     ap.add_argument("--ramp", type=float, default=0.30)
     ap.add_argument("--cap-deg", type=float, default=30.0, dest="cap_deg")
+    ap.add_argument("--grip", choices=["cap", "spread"], default="cap",
+                    help="cap = rigid polar cap (stress concentrates at the pole edge); "
+                         "spread = pull the WHOLE peel layer along pull_dir (distributed "
+                         "mode-I load on the bond, no cap-edge singularity).")
     ap.add_argument("--pull-deg", type=float, default=45.0, dest="pull_deg")
     ap.add_argument("--notch-deg", type=float, default=0.0, dest="notch_deg",
                     help="pre-delaminate the interface within this many degrees of the pulled "
@@ -216,14 +220,19 @@ def build_sim(args, dev):
     bot = sim.x[:, 1] < c[1] - 0.55 * R
     cos_up = rel[:, 1] / r.clamp(min=1e-9)
     cap = peel & (cos_up > math.cos(math.radians(args.cap_deg)))
-    sim.allow[bot] = False; sim.allow[cap] = False
+    # grip: 'cap' = rigid polar patch (stress concentrates at its edge);
+    #       'spread' = the WHOLE peel layer pulled along pull_dir, so the load is
+    #       introduced over the entire top shell -> distributed mode-I on the bond,
+    #       no cap-edge singularity (the single pull_dir still spans theta_n).
+    grip_region = peel if args.grip == "spread" else cap
+    sim.allow[bot] = False; sim.allow[grip_region] = False
     th = math.radians(args.pull_deg)
     pull_dir = torch.tensor([math.sin(th), math.cos(th), 0.0], device=dev, dtype=sim.dtype)
     speed = args.speed; ramp = args.ramp
 
     def grip(s, t):
         vmag = speed * min(t / ramp, 1.0)
-        s.v[bot] = 0.0; s.v[cap] = vmag * pull_dir
+        s.v[bot] = 0.0; s.v[grip_region] = vmag * pull_dir
     sim.particle_bc.append(grip)
 
     ring = peel & (~cap) & (cos_up > math.cos(math.radians(args.cap_deg + 15)))
@@ -231,7 +240,8 @@ def build_sim(args, dev):
 
     print(f"[peel] R={R} spacing={spacing:.5f} dx={dx:.5f} l0={l0:.5f}")
     print(f"[peel] N={sim.n:,} flesh={int(flesh.sum()):,} interface={int(interface.sum()):,} "
-          f"peel={int(peel.sum()):,} cap={int(cap.sum()):,} clamped={int(bot.sum()):,}")
+          f"peel={int(peel.sum()):,} clamped={int(bot.sum()):,}  "
+          f"grip={args.grip}({int(grip_region.sum()):,} particles)")
     print(f"[peel] sigma_c(int)={sigc_int:.0f} sigma_c(bystanders)={sigc_by:.0f} "
           f"rho={sigc_int / sigc_by:.2g}  pull_deg={args.pull_deg:.0f}  speed={args.speed}  "
           f"notch_deg={args.notch_deg:g}")

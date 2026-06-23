@@ -1,0 +1,1 @@
+{"test": "fd_check", "t": 1782052430.791536, "optionA_max_rel_err": 2.964987481764463e-10, "optionA_tol": 1e-06, "optionA_pass": true, "optionB_recon_err": 1.4210854715202004e-14, "optionB_pass": true, "optionC_normal_kept": 0.00499999999993469, "optionC_shear_kept": 0.005000003081451347, "optionC_inplane_kept": 0.9999999994358679, "optionC_pass": true, "pass": true}

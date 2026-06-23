@@ -1,45 +1,46 @@
 """Hand-tuned peel test on an ANALYTIC ball -- no PLY / assets needed.
 
-Implements the four steps:
-1. three concentric regions by SDF threshold phi(X) = |X - c| - R
-     peel       -t_p <= phi
-     interface  -(t_p+t_i) <= phi < -t_p
-     flesh      phi < -(t_p+t_i)
-   Thicknesses are auto-widened to >= 2.5 particle spacings (the plan's
-   0.03R interface is ~1.2 spacings at default resolution -- unresolvable).
-2. per-particle materials. sigma_c(interface) = sigc_frac * E_flesh; the
-   bystanders get sigma_c(int)/rho (default rho=0.1: a real toughness
-   competition). Pass --rho 0 for unbreakable bystanders (existence mode,
-   the original rigged test).
-3. structural tensors via the A0 refactor in anisompm.py:
-     flesh           A0 = I - r r^T  (radial fiber, alpha=-1: orange recipe)
-     peel/interface  A0 = r r^T      (rank-1 -> phi = (sigma_nn^+)^2 / sigma_c^2,
-                                      tangent plane fully protected; no
-                                      hairy-ball singularity to dodge)
-   Peel and interface share A0 and differ only in sigma_c / E.
-4. clamp the bottom cap (v=0), pull a small top cap of PEEL particles at
-   45 degrees ( (x+y)/sqrt2 ), ramped prescribed velocity via particle_bc.
+Architecture (refactored): the EXPENSIVE simulation and the CHEAP observables
+are split.  build_sim() + run_sim() run the physics and write a raw snapshot to
+out/sims/<tag>.pt; derive.py turns that snapshot into out/results/<tag>.json.
+The sim is cached on (config, hash(anisompm.py)) -- it re-runs ONLY when the
+physics solver changes or the config is new; observables are always re-derived
+cheaply (so changing a metric never re-runs a sim, and adding new configs never
+touches existing ones).  See derive.py and run_gate.sh.
 
-Run (GPU box):
-    python3 src/peel_test.py --device cuda:0
-Mac / Metal (uses the analytic Jacobi LA path automatically on mps):
-    python3 src/anisompm.py            # LA self-test first
-    python3 src/peel_test.py --device mps --ngrid 48 --ppcd 1.5 --frames 24
-Local CPU smoke (small, a few frames):
-    python3 src/peel_test.py --device cpu --ngrid 32 --ppcd 1.5 --frames 6 --plot-every 1
+Steps:
+1. three concentric regions by SDF threshold phi(X)=|X-c|-R (peel/interface/flesh),
+   thicknesses auto-widened to >= 2.5 spacings.
+2. per-particle materials; sigma_c(interface)=sigc_frac*E_flesh, bystanders /rho.
+3. structural tensors (--aniso) + directional stress (--directional).
+4. clamp bottom, pull a top cap; optionally pre-delaminate a pole patch (--notch-deg).
+
+Run one cell:
+    python3 src/peel_test.py --device cuda:0 --aniso correct --rho 0.1 --pull-deg 0
 """
-import os, sys, math, time, argparse
+import os, sys, math, time, json, hashlib, argparse
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 from anisompm import AnisoMPM
+from derive import derive, print_result, load_snapshot
 
 GRID_LIM = 1.0
 
 
+def _sha(path):
+    try:
+        return hashlib.sha1(open(path, "rb").read()).hexdigest()[:12]
+    except Exception:
+        return "nofile"
+
+
+SOLVER_SHA = _sha(os.path.join(os.path.dirname(__file__), "anisompm.py"))   # the PHYSICS
+SETUP_SHA = _sha(os.path.abspath(__file__))                                 # the harness (info only)
+
+
 def pick_device(spec):
-    """Resolve --device. 'auto' -> cuda, else Apple MPS, else cpu."""
     if spec and spec != "auto":
         return spec
     if torch.cuda.is_available():
@@ -49,74 +50,78 @@ def pick_device(spec):
     return "cpu"
 
 
+def config_dict(args):
+    """Canonical, behavior-reflecting config (equal_E collapses the moduli)."""
+    Ef = float(args.E_flesh)
+    Ei = Ef if args.equal_E else float(args.E_int)
+    Ep = Ef if args.equal_E else float(args.E_peel)
+    return dict(aniso=args.aniso, directional=args.directional, rho=float(args.rho),
+                pull_deg=float(args.pull_deg), equal_E=bool(args.equal_E), ngrid=int(args.ngrid),
+                ppcd=float(args.ppcd), seed=int(args.seed), sigc_frac=float(args.sigc_frac),
+                speed=float(args.speed), notch_deg=float(args.notch_deg), R=float(args.R),
+                dt=float(args.dt), ramp=float(args.ramp), eta=float(args.eta),
+                E_flesh=Ef, E_int=Ei, E_peel=Ep, f_clamp=str(args.f_clamp),
+                frames=int(args.frames), fps=int(args.fps), damage_every=int(args.damage_every))
+
+
+def config_tag(args):
+    """Readable core + 6-char hash of the FULL config (collision-proof)."""
+    cfg = config_dict(args)
+    cid = hashlib.sha1(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:6]
+    core = (f"a{args.aniso}_dir{args.directional}_rho{args.rho:g}_pull{args.pull_deg:g}"
+            f"_eq{int(bool(args.equal_E))}_ng{args.ngrid}_ppcd{args.ppcd:g}"
+            f"_seed{args.seed}_notch{args.notch_deg:g}")
+    return f"{core}__{cid}"
+
+
 def parse_args():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--device", default="auto",
-                    help="auto (cuda->mps->cpu), or cuda:0 / mps / cpu")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", default="auto")
     ap.add_argument("--ngrid", type=int, default=64)
-    ap.add_argument("--ppcd", type=float, default=2.0, help="particles per cell per dim")
+    ap.add_argument("--ppcd", type=float, default=2.0)
     ap.add_argument("--R", type=float, default=0.28)
     ap.add_argument("--frames", type=int, default=48)
     ap.add_argument("--fps", type=int, default=24)
     ap.add_argument("--dt", type=float, default=3e-4)
-    ap.add_argument("--f-clamp", default="0.35,2.8", dest="f_clamp",
-                    help="F singular-value clamp 'smin,smax' (stability) or 'none'. "
-                         "The analytic polar is float32 and the clamp rebuild can "
-                         "NaN on aggressive configs (pre-existing; see LA self-test). "
-                         "The gate uses 'none', which is stable and still develops "
-                         "damage.")
+    ap.add_argument("--f-clamp", default="0.35,2.8", dest="f_clamp")
     ap.add_argument("--E-flesh", type=float, default=2e4, dest="E_flesh")
     ap.add_argument("--E-int", type=float, default=4e4, dest="E_int")
     ap.add_argument("--E-peel", type=float, default=1e5, dest="E_peel")
-    ap.add_argument("--sigc-frac", type=float, default=0.05, dest="sigc_frac",
-                    help="sigma_c(interface) = sigc_frac * E_flesh")
-    ap.add_argument("--rho", type=float, default=0.1,
-                    help="toughness ratio: sigma_c(flesh,peel) = sigma_c(int)/rho; "
-                         "0 = unbreakable bystanders (existence mode)")
-    ap.add_argument("--damage-every", type=int, default=1, dest="damage_every",
-                    help="update the damage field every k substeps (speed)")
+    ap.add_argument("--sigc-frac", type=float, default=0.05, dest="sigc_frac")
+    ap.add_argument("--rho", type=float, default=0.1)
+    ap.add_argument("--damage-every", type=int, default=1, dest="damage_every")
     ap.add_argument("--eta", type=float, default=0.02)
-    ap.add_argument("--speed", type=float, default=0.12, help="peel pull speed")
+    ap.add_argument("--speed", type=float, default=0.12)
     ap.add_argument("--ramp", type=float, default=0.30)
-    ap.add_argument("--cap-deg", type=float, default=30.0, dest="cap_deg",
-                    help="half-angle of the pulled top peel cap")
-    ap.add_argument("--pull-deg", type=float, default=45.0, dest="pull_deg",
-                    help="pull angle off the pole normal (+y). 0=pure normal "
-                         "(mode-I tension), 90=tangential (pure shear). "
-                         "Pull dir = (sin, cos, 0) in the x-y plane.")
-    ap.add_argument("--aniso", choices=["correct", "iso", "wrong"], default="correct",
-                    help="interface (peel|interface) damage-DRIVER tensor A0: "
-                         "correct=n(x)n (normal isolation), iso=I (isotropic, no "
-                         "directional selection), wrong=I-n(x)n (tangential "
-                         "isolation, protects the normal). Flesh stays I-r(x)r.")
-    ap.add_argument("--directional", choices=["on", "off"], default="on",
-                    help="interface STRESS model: on=directional split (release "
-                         "normal+shear, keep in-plane) via directional_kirchhoff; "
-                         "off=isotropic g(d) (bonded baseline). Decoupled from "
-                         "--aniso so you can A/B the stress model with the driver "
-                         "held fixed.")
-    ap.add_argument("--equal-E", action="store_true", dest="equal_E",
-                    help="force E_int=E_peel=E_flesh: kills modulus contrast so "
-                         "correct/iso/wrong differ ONLY in the structural tensor.")
-    ap.add_argument("--seed", type=int, default=0, help="particle-lattice jitter seed")
-    ap.add_argument("--plot-every", type=int, default=4, dest="plot_every",
-                    help="save a cross-section png every k frames (0=off)")
-    ap.add_argument("--log-every", type=int, default=4, dest="log_every",
-                    help="print a metrics line every k frames (fewer device syncs)")
+    ap.add_argument("--cap-deg", type=float, default=30.0, dest="cap_deg")
+    ap.add_argument("--pull-deg", type=float, default=45.0, dest="pull_deg")
+    ap.add_argument("--notch-deg", type=float, default=0.0, dest="notch_deg",
+                    help="pre-delaminate the interface within this many degrees of the pulled "
+                         "pole (remove those particles) -- a traction-free pre-crack so the "
+                         "delamination propagates from the interface instead of the cap "
+                         "over-stressing the bulk.  0 (default) = no notch, identical to before.")
+    ap.add_argument("--aniso", choices=["correct", "iso", "wrong"], default="correct")
+    ap.add_argument("--directional", choices=["on", "off"], default="on")
+    ap.add_argument("--equal-E", action="store_true", dest="equal_E")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--plot-every", type=int, default=0, dest="plot_every")
+    ap.add_argument("--log-every", type=int, default=4, dest="log_every")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "out", "peel"))
-    ap.add_argument("--summary-json", default="", dest="summary_json",
-                    help="append a one-line JSON result record to this path "
-                         "(used by sweep_peel.py)")
+    ap.add_argument("--sims-dir", dest="sims_dir",
+                    default=os.path.join(os.path.dirname(__file__), "..", "out", "sims"))
+    ap.add_argument("--results-dir", dest="results_dir",
+                    default=os.path.join(os.path.dirname(__file__), "..", "out", "results"))
+    ap.add_argument("--force", action="store_true",
+                    help="ignore the cache and re-run the sim even if a matching snapshot exists.")
     ap.add_argument("--skip-if-done", action="store_true", dest="skip_if_done",
-                    help="resume support: if a FINITE record with this exact config "
-                         "already exists in --summary-json, skip the run. Makes the "
-                         "gate idempotent / restartable after SLURM preemption "
-                         "(re-run the same command; finished cells are skipped).")
+                    help="(accepted for back-compat; caching is on by default now).")
+    ap.add_argument("--summary-json", default="", dest="summary_json",
+                    help="(optional) ALSO append the result as one json line here.")
     return ap.parse_args()
 
 
 def ball_particles(center, R, spacing, jitter=0.3, seed=0):
-    """Jittered lattice filling a ball. Returns (N,3) float32 positions."""
     rng = np.random.default_rng(seed)
     n = int(np.ceil(2.0 * R / spacing)) + 2
     g = (np.arange(n) + 0.5) * spacing
@@ -132,8 +137,7 @@ def save_slice(sim, masks, center, spacing, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    x = sim.x.detach().cpu().numpy()
-    d = sim.d.detach().cpu().numpy()
+    x = sim.x.detach().cpu().numpy(); d = sim.d.detach().cpu().numpy()
     sl = np.abs(x[:, 2] - center[2]) < 1.5 * spacing
     fig, axs = plt.subplots(1, 2, figsize=(11, 5), dpi=110)
     colors = {"flesh": "#bbbbbb", "interface": "#ff7f0e", "peel": "#2ca02c"}
@@ -148,165 +152,114 @@ def save_slice(sim, masks, center, spacing, path):
     fig.savefig(path, bbox_inches="tight"); plt.close(fig)
 
 
-def main():
-    args = parse_args()
-
-    # ---- resume support: skip this cell if it already finished (finite) -------
-    if args.skip_if_done and args.summary_json and os.path.exists(args.summary_json):
-        key = dict(aniso=args.aniso, directional=args.directional, rho=args.rho,
-                   pull_deg=args.pull_deg, equal_E=bool(args.equal_E), ngrid=args.ngrid,
-                   ppcd=args.ppcd, seed=args.seed, sigc_frac=args.sigc_frac, speed=args.speed)
-
-        def _eq(a, b):
-            if isinstance(b, bool):
-                return a is not None and bool(a) == b
-            if isinstance(b, (int, float)):
-                return a is not None and abs(float(a) - float(b)) < 1e-9
-            return a == b
-        import json as _json
-        for _line in open(args.summary_json):
-            _line = _line.strip()
-            if not _line:
-                continue
-            try:
-                _r = _json.loads(_line)
-            except Exception:
-                continue
-            if _r.get("test") == "fd_check":
-                continue
-            if (not _r.get("nan", True)) and all(_eq(_r.get(k), v) for k, v in key.items()):
-                print(f"[peel] skip (already done, finite): {key}")
-                return
-
-    dev = pick_device(args.device)
-    print(f"[peel] device={dev}")
+def build_sim(args, dev):
+    """config -> (sim, geom).  Geometry, regions, materials, structural tensors,
+    grips, and the optional pole notch.  Deterministic for a given config+seed."""
     c = np.array([0.5, 0.5, 0.5]) * GRID_LIM
-    R = args.R
-    dx = GRID_LIM / args.ngrid
-    spacing = dx / args.ppcd
-    l0 = 0.5 * dx  # solver default (l0_scale=0.5)
-
-    # ---- Step 1: geometry. Enforce the resolvability rule explicitly. ------
-    t_p = max(0.08 * R, 2.5 * spacing)
-    t_i = max(0.07 * R, 2.5 * spacing)  # plan said 0.03R; see module docstring
+    R = args.R; dx = GRID_LIM / args.ngrid; spacing = dx / args.ppcd; l0 = 0.5 * dx
+    t_p = max(0.08 * R, 2.5 * spacing); t_i = max(0.07 * R, 2.5 * spacing)
     assert t_p + t_i < 0.7 * R, "shells eat the flesh core; raise ngrid/ppcd or R"
 
     pts = ball_particles(c, R, spacing, seed=args.seed)
+    # --- pole notch: remove a wedge of INTERFACE particles under the pull pole --
+    if args.notch_deg > 0:
+        rel0 = pts - c[None]; r0 = np.linalg.norm(rel0, axis=1); phi0 = r0 - R
+        peel0 = phi0 >= -t_p
+        interface0 = (phi0 >= -(t_p + t_i)) & ~peel0
+        cos_up0 = rel0[:, 1] / np.maximum(r0, 1e-9)
+        notch0 = interface0 & (cos_up0 > math.cos(math.radians(args.notch_deg)))
+        pts = pts[~notch0]
+        print(f"[peel] notch: removed {int(notch0.sum()):,} interface particles "
+              f"within {args.notch_deg:g} deg of the pole (pre-delamination)")
+
     x = torch.tensor(pts, device=dev)
     vol = torch.full((len(pts),), spacing ** 3, device=dev)
-
     fclamp = (None if str(args.f_clamp).lower() == "none"
               else tuple(float(v) for v in str(args.f_clamp).split(",")))
-    sim = AnisoMPM(n_grid=args.ngrid, grid_lim=GRID_LIM, dt=args.dt,
-                   gravity=(0.0, 0.0, 0.0), grid_damp=0.999,
-                   f_clamp=fclamp, damage_every=args.damage_every, device=dev)
-    # placeholder elasticity/sigma_c -- overwritten per region below
-    sim.add_object(x, vol, rho=500, E=args.E_flesh, nu=0.4,
-                   fibers=None, alpha=0.0, percentage=1.0,
-                   eta=args.eta, zeta=1.0, residual=0.005, allow_damage=True)
+    sim = AnisoMPM(n_grid=args.ngrid, grid_lim=GRID_LIM, dt=args.dt, gravity=(0.0, 0.0, 0.0),
+                   grid_damp=0.999, f_clamp=fclamp, damage_every=args.damage_every, device=dev)
+    sim.add_object(x, vol, rho=500, E=args.E_flesh, nu=0.4, fibers=None, alpha=0.0,
+                   percentage=1.0, eta=args.eta, zeta=1.0, residual=0.005, allow_damage=True)
 
     ct = torch.tensor(c, device=dev, dtype=sim.dtype)
-    rel = sim.x - ct
-    r = rel.norm(dim=1)
-    phi = r - R
+    rel = sim.x - ct; r = rel.norm(dim=1); phi = r - R
     peel = phi >= -t_p
     interface = (phi >= -(t_p + t_i)) & ~peel
     flesh = ~peel & ~interface
     masks = dict(flesh=flesh, interface=interface, peel=peel)
 
-    # ---- Step 2: per-particle materials ------------------------------------
     def lame(E, nu=0.4):
         return E / (2 * (1 + nu)), E * nu / ((1 + nu) * (1 - 2 * nu))
-
-    if args.equal_E:                          # Block 1: strip modulus contrast
+    if args.equal_E:
         args.E_int = args.E_peel = args.E_flesh
     for m, E in ((flesh, args.E_flesh), (interface, args.E_int), (peel, args.E_peel)):
-        mu, lam = lame(E)
-        sim.mu[m] = mu
-        sim.lam[m] = lam
-    sigc_int = args.sigc_frac * args.E_flesh  # designated failure zone
-    sigc_by = sigc_int / args.rho if args.rho > 0 else 1e9  # bystanders: tough or unbreakable
-    sim.sigma_c[:] = sigc_by
-    sim.sigma_c[interface] = sigc_int
+        mu, lam = lame(E); sim.mu[m] = mu; sim.lam[m] = lam
+    sigc_int = args.sigc_frac * args.E_flesh
+    sigc_by = sigc_int / args.rho if args.rho > 0 else 1e9
+    sim.sigma_c[:] = sigc_by; sim.sigma_c[interface] = sigc_int
 
-    # ---- Step 3: structural tensors (AFTER add_object -- it rebuilds A0) ---
     r_hat = rel / r.clamp(min=1e-9).unsqueeze(1)
-    rr = r_hat.unsqueeze(2) * r_hat.unsqueeze(1)  # (N,3,3) r x r
+    rr = r_hat.unsqueeze(2) * r_hat.unsqueeze(1)
     I3 = torch.eye(3, device=dev, dtype=sim.dtype)
-    sim.set_structural_tensor(flesh, (I3 - rr)[flesh])             # flesh: orange recipe
-    # interface (peel|interface) damage-DRIVER tensor A0, per --aniso:
+    sim.set_structural_tensor(flesh, (I3 - rr)[flesh])
     iface = peel | interface
     if args.aniso == "correct":
-        A_if = rr                                  # n(x)n -> phi=(sigma_nn^+/sigma_c)^2
+        A_if = rr
     elif args.aniso == "iso":
-        A_if = I3.expand(sim.n, 3, 3)              # isotropic driver (no selection)
-    else:                                          # "wrong": tangential isolation
-        A_if = I3 - rr                             # protects normal, drives on shear
+        A_if = I3.expand(sim.n, 3, 3)
+    else:
+        A_if = I3 - rr
     sim.set_structural_tensor(iface, A_if[iface])
-    # STRESS model, decoupled from the driver: registering the interface normals
-    # switches substep to the directional split there.  --directional off leaves
-    # the isotropic g(d) bonded baseline (matrix still holds the bond at d=1).
     if args.directional == "on":
         sim.set_interface_normals(iface, r_hat[iface])
 
-    # ---- Step 4: clamp bottom, pull top peel cap at 45 degrees -------------
     bot = sim.x[:, 1] < c[1] - 0.55 * R
     cos_up = rel[:, 1] / r.clamp(min=1e-9)
     cap = peel & (cos_up > math.cos(math.radians(args.cap_deg)))
-    sim.allow[bot] = False
-    sim.allow[cap] = False  # grip regions never damage
-    th = math.radians(args.pull_deg)  # angle off the +y pole normal
-    pull_dir = torch.tensor([math.sin(th), math.cos(th), 0.0],
-                            device=dev, dtype=sim.dtype)
+    sim.allow[bot] = False; sim.allow[cap] = False
+    th = math.radians(args.pull_deg)
+    pull_dir = torch.tensor([math.sin(th), math.cos(th), 0.0], device=dev, dtype=sim.dtype)
+    speed = args.speed; ramp = args.ramp
 
     def grip(s, t):
-        vmag = args.speed * min(t / args.ramp, 1.0)
-        s.v[bot] = 0.0
-        s.v[cap] = vmag * pull_dir
+        vmag = speed * min(t / ramp, 1.0)
+        s.v[bot] = 0.0; s.v[cap] = vmag * pull_dir
     sim.particle_bc.append(grip)
 
+    ring = peel & (~cap) & (cos_up > math.cos(math.radians(args.cap_deg + 15)))
+    halo_pred = math.exp(-spacing / l0); break_thresh = max(0.5, halo_pred + 0.25)
+
     print(f"[peel] R={R} spacing={spacing:.5f} dx={dx:.5f} l0={l0:.5f}")
-    print(f"[peel] t_p={t_p:.4f} ({t_p/spacing:.1f} spacings)  "
-          f"t_i={t_i:.4f} ({t_i/spacing:.1f} spacings, {t_i/l0:.1f} l0)")
     print(f"[peel] N={sim.n:,} flesh={int(flesh.sum()):,} interface={int(interface.sum()):,} "
           f"peel={int(peel.sum()):,} cap={int(cap.sum()):,} clamped={int(bot.sum()):,}")
     print(f"[peel] sigma_c(int)={sigc_int:.0f} sigma_c(bystanders)={sigc_by:.0f} "
-          f"rho={sigc_int / sigc_by:.2g}"
-          f"{' [existence mode: bystanders unbreakable]' if args.rho <= 0 else ''}")
-    print(f"[peel] pull_deg={args.pull_deg:.0f} off normal  "
-          f"pull_dir=({float(pull_dir[0]):.3f},{float(pull_dir[1]):.3f},0)  "
-          f"speed={args.speed}")
+          f"rho={sigc_int / sigc_by:.2g}  pull_deg={args.pull_deg:.0f}  speed={args.speed}  "
+          f"notch_deg={args.notch_deg:g}")
 
-    # per-run output folder whose name encodes the settings (so a sweep does not
-    # overwrite itself).  e.g. out/peel/rho0.1_pull45_sigc0.05_ng64_ppcd2_R0.28
-    tag = (f"rho{args.rho:g}_pull{args.pull_deg:g}_sigc{args.sigc_frac:g}"
-           f"_ng{args.ngrid}_ppcd{args.ppcd:g}_R{args.R:g}")
-    run_dir = os.path.join(args.out, tag)
-    os.makedirs(run_dir, exist_ok=True)
-    print(f"[peel] outputs -> {run_dir}")
-    x0 = sim.x.clone()                                        # initial positions (Block-D gap)
+    geom = dict(interface=interface, flesh=flesh, peel=peel, cap=cap, ring=ring, bot=bot,
+                r_hat=r_hat, x0=sim.x.clone(), pull_dir=pull_dir, masks=masks,
+                break_thresh=break_thresh, halo_pred=halo_pred, spacing=spacing, l0=l0,
+                c=c, R=R, t_p=t_p, t_i=t_i, sigc_int=sigc_int, sigc_by=sigc_by)
+    return sim, geom
+
+
+def run_sim(args, sim, geom, run_dir):
+    """Run the frame loop; capture the delamination-ONSET state + peak reductions
+    + final state into a snapshot dict (CPU).  Computes NO observables."""
+    dev = sim.device
+    interface = geom["interface"]; flesh = geom["flesh"]; peel = geom["peel"]; cap = geom["cap"]
     n_sub = max(1, int((1.0 / args.fps) / args.dt))
     t0 = time.time()
-    phi_peak = torch.zeros(3, device=dev, dtype=sim.dtype)    # [int, flesh, peel], on device
-    phi_shear_peak = torch.zeros((), device=dev, dtype=sim.dtype)  # interface mode-II drive
-    phi_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)  # per-particle phi peak (Block 2)
-    psh_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)  # per-particle phi_shear peak
-    # halo-aware bystander-break threshold (ppcd-invariant; see verdict note),
-    # computed before the loop so the onset snapshot can use it.
-    halo_pred = math.exp(-spacing / l0)
-    break_thresh = max(0.5, halo_pred + 0.25)                # 0.62 @ ppcd2, 0.70 @ ppcd2.5
-    # Grade the DELAMINATION EVENT, not the over-pulled tail.  d is irreversible,
-    # so bystander damage only grows -> the final frame is the WORST selectivity
-    # and routing (phi_int/phi_bystander) inverts once the bystanders catch up.
-    # So: track peak routing, and snapshot the whole state at the first frame the
-    # interface delaminates (>5% broken).  Selectivity/routing/cos2/release are
-    # read at that snapshot; EXISTENCE uses the achieved (monotone) maximum.
+    phi_peak = torch.zeros(3, device=dev, dtype=sim.dtype)
+    phi_shear_peak = torch.zeros((), device=dev, dtype=sim.dtype)
+    phi_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)
+    psh_pp = torch.zeros(sim.n, device=dev, dtype=sim.dtype)
     peak_routing = torch.zeros((), device=dev, dtype=sim.dtype)
     onset_reached = False; onset_frame = -1
     d_snap = phipp_snap = pshpp_snap = tau_snap = J_snap = x_snap = None
+    aborted = False
     for f in range(args.frames):
         sim.run_frame(n_sub, f / args.fps)
-        # running phi maxima accumulate on-device -- no host sync per frame
         ph = getattr(sim, "phi", None)
         if ph is not None:
             phf = torch.stack([ph[interface].max(), ph[flesh].max(), ph[peel].max()])
@@ -318,181 +271,87 @@ def main():
             phi_shear_peak = torch.maximum(phi_shear_peak, psh[interface].max())
             psh_pp = torch.maximum(psh_pp, psh)
         if not onset_reached and float((sim.d[interface] > 0.5).float().mean()) > 0.05:
-            onset_reached = True; onset_frame = f                # delamination onset
+            onset_reached = True; onset_frame = f
             d_snap = sim.d.clone(); phipp_snap = phi_pp.clone(); pshpp_snap = psh_pp.clone()
             tl = getattr(sim, "tau_last", None); Jl = getattr(sim, "J_last", None)
             tau_snap = None if tl is None else tl.clone()
             J_snap = None if Jl is None else Jl.clone()
             x_snap = sim.x.clone()
-            if args.plot_every:                                  # the clean 'money shot'
-                save_slice(sim, masks, c, spacing, os.path.join(run_dir, f"slice_ONSET_f{f:03d}.png"))
-
+            if args.plot_every:
+                save_slice(sim, geom["masks"], geom["c"], geom["spacing"],
+                           os.path.join(run_dir, f"slice_ONSET_f{f:03d}.png"))
         if (f % args.log_every == 0) or (f == args.frames - 1):
             di, dfl, dpe = sim.d[interface], sim.d[flesh], sim.d[peel]
             phf3 = phf if ph is not None else torch.full((3,), float("nan"), device=dev)
-            # gather every scalar into ONE tensor -> a single device->host copy
-            row = torch.stack([
-                di.mean(), di.max(), (di > 0.5).float().mean(),
-                dfl.max(), dpe.max(),
-                phf3[0], phf3[1], phf3[2],
-                sim.x[cap, 1].mean(),
-                torch.isnan(sim.x).any().to(sim.dtype),
-            ]).cpu().tolist()
-            dim, dimx, brk, dflx, dpex, pi, pfl, ppe, capy, nan_ = row
+            row = torch.stack([di.mean(), di.max(), (di > 0.5).float().mean(), dfl.max(), dpe.max(),
+                               phf3[0], phf3[1], phf3[2], sim.x[cap, 1].mean(),
+                               torch.isnan(sim.x).any().to(sim.dtype)]).cpu().tolist()
+            dim, dimx, brk, dflx, dpex, pi, pfl, ppe, capy, nanf = row
             phs = "" if ph is None else f" phi_max[int,fl,pe]={pi:.2f},{pfl:.2f},{ppe:.2f}"
-            print(f"  f{f:3d} d_int[mean,max]={dim:.3f},{dimx:.3f}"
-                  f" broken_int={brk:.3f}"
-                  f" d_flesh_max={dflx:.3f} d_peel_max={dpex:.3f}"
-                  f"{phs} cap_y={capy:.3f} nan={bool(nan_)} ({time.time()-t0:.0f}s)", flush=True)
-            if nan_:                                          # diverged: stop now
-                print(f"  ABORT: non-finite state at frame {f} -- "
-                      f"lower --dt / --speed / --E-peel, or check the LA self-test.")
+            print(f"  f{f:3d} d_int[mean,max]={dim:.3f},{dimx:.3f} broken_int={brk:.3f}"
+                  f" d_flesh_max={dflx:.3f} d_peel_max={dpex:.3f}{phs} cap_y={capy:.3f}"
+                  f" nan={bool(nanf)} ({time.time()-t0:.0f}s)", flush=True)
+            if nanf:
+                aborted = True
+                print(f"  ABORT: non-finite at frame {f} -- lower --dt / --speed / --E-peel.")
                 break
         if args.plot_every and (f % args.plot_every == 0 or f == args.frames - 1):
-            save_slice(sim, masks, c, spacing, os.path.join(run_dir, f"slice_{f:03d}.png"))
+            save_slice(sim, geom["masks"], geom["c"], geom["spacing"],
+                       os.path.join(run_dir, f"slice_{f:03d}.png"))
 
-    # ---- verdict ------------------------------------------------------------
-    # NOTE on selectivity: the phase-field crack is a diffuse band of width
-    # ~l0 that ignores region labels -- bystanders one spacing from a d=1 band
-    # equilibrate at d ~ exp(-spacing/l0) by the Laplacian term alone. That
-    # halo is the method working, not leakage. Failure means a bystander
-    # actually BREAKS (d > 0.5), so that's what we test.
-    # evaluation state: the over-pull-sensitive metrics (selectivity, cos2,
-    # release, gap, grip) are read at the DELAMINATION-ONSET snapshot, not the
-    # over-pulled final frame.  EXISTENCE uses the achieved (monotone) maximum.
     if onset_reached:
         d_e, phipp_e, pshpp_e, x_e, tau_e, J_e = d_snap, phipp_snap, pshpp_snap, x_snap, tau_snap, J_snap
-    else:                                                    # never delaminated -> final state
+    else:
         d_e, phipp_e, pshpp_e, x_e = sim.d, phi_pp, psh_pp, sim.x
         tau_e = getattr(sim, "tau_last", None); J_e = getattr(sim, "J_last", None)
-    broken_int_frac = float((sim.d[interface] > 0.5).float().mean())   # achieved max (monotone)
-    exist = bool(onset_reached) or broken_int_frac > 0.05
-    # halo-aware bystander-break threshold (break_thresh/halo_pred set before the
-    # loop).  Bystander damage is read at ONSET: d is irreversible, so the final
-    # frame is the worst-case selectivity once over-pull damages everything.
-    n_out = int((d_e[flesh] > break_thresh).sum()) + int((d_e[peel] > break_thresh).sum())
-    d_bystander_max = max(float(d_e[flesh].max()), float(d_e[peel].max()))         # at onset
-    d_bystander_final = max(float(sim.d[flesh].max()), float(sim.d[peel].max()))   # over-pull tail
+    nan_state = bool(aborted or torch.isnan(sim.x).any())
 
-    # routing: interface drive vs the toughest bystander drive, taken at its PEAK
-    # over the run (non-monotone: high while the interface leads, then inverts once
-    # the over-pulled bystanders catch up).  With contrast and geometry stripped
-    # (Block 1: rho=1, --equal-E) this isolates the structural tensor's selectivity.
-    pk = phi_peak.cpu().tolist()                              # [int, flesh, peel] running max
-    phi_bystander_max = max(pk[1], pk[2])
-    routing = float(peak_routing)
+    region = torch.zeros(sim.n, dtype=torch.int8)
+    region[interface.cpu()] = 1; region[peel.cpu()] = 2     # flesh stays 0
+    cpu = lambda t: None if t is None else t.detach().to("cpu")
+    return dict(
+        config=config_dict(args), solver_sha=SOLVER_SHA, setup_sha=SETUP_SHA,
+        onset_frame=int(onset_frame), nan=nan_state, secs=round(time.time() - t0, 1), N=int(sim.n),
+        region=region, cap=cpu(cap), ring=cpu(geom["ring"]),
+        r_hat=cpu(geom["r_hat"]), x0=cpu(geom["x0"]), pull_dir=cpu(geom["pull_dir"]),
+        break_thresh=float(geom["break_thresh"]), halo_pred=float(geom["halo_pred"]),
+        d_e=cpu(d_e), phipp_e=cpu(phipp_e), pshpp_e=cpu(pshpp_e), x_e=cpu(x_e),
+        tau_e=cpu(tau_e), J_e=cpu(J_e), d_f=cpu(sim.d),
+        phi_peak=cpu(phi_peak), phi_shear_peak=float(phi_shear_peak), peak_routing=float(peak_routing),
+    )
 
-    # --- Block 2: angular law via the magnitude-free ratio ---------------------
-    # The initiation criterion is phi_int/phi_shear ~ cot^2(theta_n).  IMPORTANT:
-    # the normal driver squares an already-quadratic traction, so phi_int ~ cos^4
-    # (NOT cos^2) -- plotting phi_int alone vs cos^2 looks superlinear by design.
-    # The RATIO cancels the load magnitude and is the exact LHS of the criterion.
-    # At pull_deg=0 the shell presents every theta_n in [0,90], so ONE run fits
-    # the whole law.  log-log slope -> +1 for 'correct' (normal driver), < 0 for
-    # 'wrong' (shear driver tracks sin^2), and scatters (low R^2) for 'iso'.
-    cth = (r_hat @ pull_dir).clamp(-1.0, 1.0)                 # cos(theta_n) per particle
-    loaded = interface & (cth > 0) & (phipp_e > 1e-6) & (pshpp_e > 1e-9)
-    cos2_slope = float("nan"); cos2_r2 = float("nan"); cos2_n = int(loaded.sum())
-    if cos2_n > 8:
-        cos2 = cth[loaded] ** 2
-        sin2 = (1.0 - cos2).clamp(min=1e-6)
-        ratio_pred = cos2 / sin2                              # cot^2(theta_n)
-        ratio_obs = phipp_e[loaded] / (pshpp_e[loaded] + 1e-12)
-        m2 = (ratio_obs > 1e-6) & (ratio_pred > 1e-3) & (ratio_pred < 1e3)
-        if int(m2.sum()) > 8:
-            X = torch.log(ratio_pred[m2]); Y = torch.log(ratio_obs[m2])
-            Xb = X - X.mean(); Yb = Y - Y.mean()
-            cos2_slope = float((Xb @ Yb) / (Xb @ Xb + 1e-12))
-            ss_res = float(((Yb - cos2_slope * Xb) ** 2).sum())
-            cos2_r2 = 1.0 - ss_res / (float((Yb ** 2).sum()) + 1e-12)
 
-    # grip-leak check (meaningful, unlike grip_d on the clamped cap which is
-    # frozen by allow=False): max damage in the ALLOWED peel ring just below the
-    # pulled cap.  High here = the pull is tearing at the grip, not delaminating.
-    ring = peel & (~cap) & (cos_up > math.cos(math.radians(args.cap_deg + 15)))
-    grip_d_max = float(d_e[ring].max()) if int(ring.sum()) > 0 else 0.0
+def main():
+    args = parse_args()
+    tag = config_tag(args)
+    os.makedirs(args.sims_dir, exist_ok=True); os.makedirs(args.results_dir, exist_ok=True)
+    snap_path = os.path.join(args.sims_dir, tag + ".pt")
 
-    # directional-stress observable: at damaged interface particles the normal
-    # traction should collapse (normal_release -> 1) while the in-plane stress is
-    # retained (inplane_keep -> 1).  Isotropic g(d) ALSO releases the normal under
-    # tension, but inplane_keep -> 0 there -- so inplane_keep is the discriminant
-    # that the directional split (not just damage) is doing the work.
-    normal_release = inplane_keep = float("nan")
-    if tau_e is not None and J_e is not None and int(interface.sum()) > 0:
-        sig = tau_e / J_e.view(-1, 1, 1)                      # degraded Cauchy stress (at onset)
-        nrm = r_hat
-        Sn = torch.einsum('pij,pj->pi', sig, nrm)
-        tn = (Sn * nrm).sum(1).abs()                          # |normal traction|
-        Pn = nrm.unsqueeze(2) * nrm.unsqueeze(1)
-        Qn = I3 - Pn
-        sip = (Qn @ sig @ Qn).reshape(sim.n, -1).norm(dim=1)  # in-plane stress mag
-        intact = interface & (d_e < 0.1)
-        broken = interface & (d_e > 0.5)
-        if int(intact.sum()) > 0 and int(broken.sum()) > 0:
-            normal_release = 1.0 - float(tn[broken].mean() / (tn[intact].mean() + 1e-9))
-            inplane_keep = float(sip[broken].mean() / (sip[intact].mean() + 1e-9))
+    snap = None
+    if os.path.exists(snap_path) and not args.force:
+        cand = load_snapshot(snap_path)
+        if str(cand.get("solver_sha")) == SOLVER_SHA and not bool(cand.get("nan")):
+            print(f"[peel] cached sim (solver match): {tag}")
+            snap = cand
+        else:
+            print(f"[peel] re-run (cache stale: solver "
+                  f"{str(cand.get('solver_sha'))[:8]} vs {SOLVER_SHA[:8]}, nan={cand.get('nan')})")
+    if snap is None:
+        dev = pick_device(args.device); print(f"[peel] device={dev}  tag={tag}")
+        sim, geom = build_sim(args, dev)
+        run_dir = os.path.join(args.out, tag); os.makedirs(run_dir, exist_ok=True)
+        snap = run_sim(args, sim, geom, run_dir)
+        torch.save(snap, snap_path)
+        print(f"[peel] snapshot -> {snap_path}")
 
-    # Block-D KINEMATIC outcome (de-tautologized): inplane_keep above is read off
-    # tau_last = the split itself, so it is ~>1 for 'on' by construction (keep it
-    # only as an integration smoke that the split fires).  The OUTCOME that proves
-    # delamination is a normal GAP opening at the interface while the peel stays
-    # intact (sheet lifts) -- with isotropic g(d) the same separation needs the
-    # interface mushed, so the gap doesn't cleanly open and the peel itself damages.
-    # gap = increase in distance from each interface particle to nearest flesh.
-    normal_gap = float("nan")
-    d_peel_max = float(d_e[peel].max()) if int(peel.sum()) > 0 else float("nan")
-    if int(interface.sum()) > 0 and int(flesh.sum()) > 0:
-        fi = torch.nonzero(interface, as_tuple=False).squeeze(1)
-        ff = torch.nonzero(flesh, as_tuple=False).squeeze(1)
-        if ff.numel() > 20000:                                # bound memory at fine res
-            ff = ff[torch.randperm(ff.numel(), device=dev)[:20000]]
-
-        def _nn(Xq, Xref, chunk=4096):
-            out = torch.empty(Xq.shape[0], device=dev, dtype=sim.dtype)
-            for i in range(0, Xq.shape[0], chunk):
-                out[i:i + chunk] = torch.cdist(Xq[i:i + chunk], Xref).min(dim=1).values
-            return out
-        gap = (_nn(x_e[fi], x_e[ff]) - _nn(x0[fi], x0[ff])).clamp(min=0.0)
-        br_i = d_e[fi] > 0.5
-        normal_gap = float(gap[br_i].mean()) if int(br_i.sum()) > 0 else 0.0
-
-    print(f"\n[peel] aniso={args.aniso} directional={args.directional} "
-          f"equal_E={args.equal_E} seed={args.seed}")
-    print(f"[peel] EXISTENCE (>5% interface broken): {'PASS' if exist else 'FAIL'}  "
-          f"(broken_int_frac={broken_int_frac:.3f}, delam onset frame={onset_frame})")
-    print(f"[peel] SELECTIVITY (no bystander breaks @ onset): {'PASS' if n_out == 0 else 'FAIL'}  "
-          f"(broken_outside={n_out}, d_bystander @onset={d_bystander_max:.2f} @final={d_bystander_final:.2f}, "
-          f"thresh={break_thresh:.2f}, halo~{halo_pred:.2f})")
-    print(f"[peel] routing phi_int/phi_bystander={routing:.2f}  "
-          f"(phi_int={pk[0]:.2f} phi_bystander={phi_bystander_max:.2f} phi_shear={float(phi_shear_peak):.2f})")
-    print(f"[peel] Block2 angular law: phi_int/phi_shear ~ cot^2(theta) "
-          f"slope={cos2_slope:.2f} R2={cos2_r2:.2f} n={cos2_n} (want slope~+1 for correct)")
-    print(f"[peel] Block-D outcome: normal_gap={normal_gap:.4f} d_peel_max={d_peel_max:.2f}  "
-          f"| inplane_keep={inplane_keep:.2f} (wiring smoke)  grip_d_max={grip_d_max:.3f}")
-    if not exist:
-        print("  -> lower --sigc-frac, raise --speed, or run more --frames")
-
-    if args.summary_json:
-        import json
-        rec = dict(
-            aniso=args.aniso, directional=args.directional, equal_E=bool(args.equal_E),
-            seed=args.seed, rho=args.rho, pull_deg=args.pull_deg, sigc_frac=args.sigc_frac,
-            speed=args.speed, ngrid=args.ngrid, ppcd=args.ppcd, frames=args.frames,
-            phi_int_max=pk[0], phi_bystander_max=phi_bystander_max,
-            phi_flesh_max=pk[1], phi_peel_max=pk[2], phi_shear_max=float(phi_shear_peak),
-            routing=routing, broken_int_frac=broken_int_frac, onset_frame=onset_frame,
-            cos2_slope=cos2_slope, cos2_r2=cos2_r2, cos2_n=cos2_n,
-            d_int_max=float(sim.d[interface].max()), d_bystander_max=d_bystander_max,
-            d_bystander_final=d_bystander_final,
-            d_peel_max=d_peel_max, break_thresh=break_thresh,
-            grip_d_max=grip_d_max, normal_release=normal_release, inplane_keep=inplane_keep,
-            normal_gap=normal_gap,
-            n_broken_outside=n_out, exist=bool(exist), select=bool(n_out == 0),
-            nan=bool(torch.isnan(sim.x).any()), secs=round(time.time() - t0, 1),
-        )
+    result = derive(snap)                                   # cheap; always fresh
+    print_result(result)
+    with open(os.path.join(args.results_dir, tag + ".json"), "w") as fh:
+        json.dump(result, fh, indent=1)
+    print(f"[peel] result -> {os.path.join(args.results_dir, tag + '.json')}")
+    if args.summary_json:                                   # optional back-compat log
         with open(args.summary_json, "a") as fh:
-            fh.write(json.dumps(rec) + "\n")
-        print(f"[peel] appended summary -> {args.summary_json}")
+            fh.write(json.dumps(result) + "\n")
 
 
 if __name__ == "__main__":
